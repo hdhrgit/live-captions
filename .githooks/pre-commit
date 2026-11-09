@@ -1,0 +1,6 @@
+#!/bin/sh
+# Refuses a commit that adds something personal, or Go code gofmt would change.
+if ! "$(dirname "$0")/check.sh" staged; then
+	echo "pre-commit: fix the lines above, or commit with --no-verify." >&2
+	exit 1
+fi

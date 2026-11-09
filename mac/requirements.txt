@@ -1,0 +1,12 @@
+# captions-dvr ASR service on Apple Silicon
+mlx-whisper
+# Silero VAD (speech ratio for the relay's guard)
+faster-whisper==1.2.1
+av<16
+numpy
+# NLLB-200 translation (CTranslate2 comes with faster-whisper)
+sentencepiece
+# SeamlessM4T v2 (optional fourth subtitle track)
+transformers
+torch
+protobuf

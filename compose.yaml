@@ -1,0 +1,36 @@
+services:
+  relay:
+    build: relay
+    image: captions-dvr:dev
+    container_name: captions-dvr
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8095}   # set in .env: how Channels DVR reaches the relay
+      DELAY: "20"
+      GRACE: "60"
+      # remote (the ASR server at ASR_URL) | none (no subtitles)
+      ASR_BACKEND: remote
+      ASR_URL: ${ASR_URL:-http://asr-host:8096}   # set in .env: the Mac running asr_server.py
+      ASR_TIMEOUT: "10"
+      AC4_FFMPEG: ${AC4_FFMPEG:-}
+      # Last hour of ASR chunks (WAV + JSON with raw output and drop reasons)
+      ARCHIVE_DIR: /archive
+      ARCHIVE_MINUTES: "60"
+      # Sources and channel selection, edited in the web page at /
+      CHANNELS_FILE: /config/channels.json
+    volumes:
+      - models:/models
+      - ./archive:/archive
+      - ./config:/config
+    cpu_shares: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8095/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  models:
+    name: captions-models

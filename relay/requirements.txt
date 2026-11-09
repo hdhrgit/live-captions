@@ -1,0 +1,7 @@
+# The relay. PyAV wheels bundle ffmpeg. CTranslate2 + sentencepiece run
+# NLLB on the CPU for the programme guide translation.
+av>=15,<16
+numpy
+pillow
+ctranslate2
+sentencepiece

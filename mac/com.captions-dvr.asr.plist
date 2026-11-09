@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.captions-dvr.asr</string>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- caffeinate -s (on AC) and -i keep the Mac out of system sleep while the
+         service runs; -i alone still allowed sleep with dark wakes on the mini -->
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>-i</string>
+    <string>@PREFIX@/venv/bin/python</string>
+    <string>-u</string>
+    <string>@PREFIX@/app/asr_server.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>@PREFIX@/app</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ASR_BACKEND</key><string>mlx</string>
+    <key>MODEL</key><string>@MODEL@</string>
+    <key>PORT</key><string>@PORT@</string>
+    <key>NLLB_MODEL</key><string>@NLLB@</string>
+    <!-- The CPU lane (NLLB) runs while the GPU decodes: use the performance cores -->
+    <key>NLLB_THREADS</key><string>6</string>
+    <key>SEAMLESS_MODEL</key><string>@SEAMLESS@</string>
+    <!-- Seamless runs on PyTorch MPS; let unsupported ops fall back to CPU -->
+    <key>PYTORCH_ENABLE_MPS_FALLBACK</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>@LOG@</string>
+  <key>StandardErrorPath</key><string>@LOG@</string>
+</dict>
+</plist>

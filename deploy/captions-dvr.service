@@ -1,0 +1,26 @@
+[Unit]
+Description=captions-dvr relay (HLS to MPEG-TS with English CEA-608 captions)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=captions-dvr
+Group=captions-dvr
+EnvironmentFile=/etc/captions-dvr/captions-dvr.env
+WorkingDirectory=/opt/captions-dvr/app
+ExecStart=/opt/captions-dvr/venv/bin/python -u /opt/captions-dvr/app/relay.py
+Restart=always
+RestartSec=5
+# Keep the relay polite next to Channels DVR
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/captions-dvr
+# /var/lib/captions-dvr, writable: channel config and the optional ASR chunk archive
+StateDirectory=captions-dvr
+
+[Install]
+WantedBy=multi-user.target

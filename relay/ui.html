@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>captions-dvr</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1d2129; --muted: #667085; --line: #e3e6eb;
+    --ok: #12805c; --warn: #b54708; --bad: #c01048; --chip: #eef1f5; --live: #12805c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1f25; --fg: #e6e9ee; --muted: #8b95a3; --line: #2a313a;
+      --ok: #3ccb8c; --warn: #f5a524; --bad: #f2547d; --chip: #252c35; --live: #3ccb8c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
+           padding: 16px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 18px; margin: 0; }
+  .muted { color: var(--muted); }
+  main { padding: 16px; display: grid; gap: 16px;
+         grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+  .chip { background: var(--chip); border-radius: 999px; padding: 2px 9px; font-size: 12px; white-space: nowrap; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .live .dot { background: var(--live); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  h2 .num { color: var(--muted); font-weight: normal; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  td { padding: 3px 0; vertical-align: top; border-top: 1px solid var(--line); }
+  td.t { color: var(--muted); white-space: nowrap; padding-right: 10px; font-variant-numeric: tabular-nums; }
+  .kv { font-variant-numeric: tabular-nums; }
+  a { color: inherit; }
+  #err { color: var(--bad); }
+  nav { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+  nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+               font: inherit; padding: 10px 12px; cursor: pointer; }
+  nav button.on { color: var(--fg); border-bottom-color: var(--fg); }
+  #manage { padding: 16px; display: none; }
+  input, select, button.b { font: inherit; color: var(--fg); background: var(--card);
+               border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button.b { cursor: pointer; }
+  input[type=checkbox] { width: 16px; height: 16px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 12px; }
+  .grow { flex: 1 1 220px; min-width: 0; }
+  .scroll { overflow-x: auto; }
+  #chtable td { padding: 5px 8px 5px 0; vertical-align: middle; }
+  #chtable td.n input { width: 72px; } #chtable td.l input { width: 64px; }
+  #chtable .name { font-weight: 500; } #chtable .sub { color: var(--muted); font-size: 12px; }
+  h3 { font-size: 15px; margin: 16px 0 4px; }
+  #chtable:not(.showadv) td.adv { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>captions-dvr</h1>
+  <span id="asr" class="kv"></span>
+  <span class="muted kv" id="clock"></span>
+  <span class="muted"><a href="playlist.m3u">playlist.m3u</a> · <a href="status">status JSON</a></span>
+  <span id="err"></span>
+</header>
+<nav><button id="tab-live" class="on">Live</button><button id="tab-manage">Sources &amp; channels</button></nav>
+<main id="channels"></main>
+<section id="manage">
+  <h3>Add a source</h3>
+  <div class="muted">A 2-letter country code (iptv-org, e.g. <b>us</b>, <b>gb</b>, <b>kp</b>) or any M3U/M3U8 URL.
+    Nothing is enabled until you tick it below; enabled channels appear in <a href="playlist.m3u">playlist.m3u</a>
+    after Channels DVR refreshes the source. Programme guide: <a href="epg.xml">epg.xml</a>
+    <span id="epgupd" class="muted"></span>.</div>
+  <div class="tools"><input id="spec" class="grow" placeholder="us   or   https://example.com/list.m3u">
+    <button class="b" id="add">Add</button> <span id="addmsg" class="muted"></span></div>
+  <div id="sources"></div>
+  <h3>Channels</h3>
+  <div class="tools">
+    <input id="q" class="grow" placeholder="Search name, group or source">
+    <select id="src"><option value="">All sources</option></select>
+    <label><input type="checkbox" id="majors" checked> major networks only</label>
+    <label><input type="checkbox" id="nogeo" checked> hide geo-blocked</label>
+    <label><input type="checkbox" id="nobroken" checked> hide broken</label>
+    <button class="b" id="check">Check streams</button> <span id="checkmsg" class="muted"></span>
+    <label><input type="checkbox" id="only"> enabled only</label>
+    <label title="Show the 608/708 caption layout options (rows, centring); WebVTT subtitles don't need them"><input type="checkbox" id="adv"> Advanced (608/708)</label>
+    <label title="An ffmpeg binary that can decode AC-4 audio (ATSC 3.0), path inside the relay; empty: such channels can't be captioned"><input id="affmpeg" size="22" placeholder="audio ffmpeg (AC-4)"></label>
+    <span id="cmpdef" title="Compare defaults: the backends burned into a channel in Compare mode (here and for /api/stream?compare=1), and the video resolution. Every extra backend costs Mac time."></span>
+    <span id="count" class="muted"></span>
+  </div>
+  <div class="scroll"><table id="chtable"></table></div>
+  <details id="langbox"><summary>Detected languages <span class="muted">(channels on "auto", remembered per stream)</span></summary>
+    <table id="langs_t"></table></details>
+  <datalist id="langs"><option>auto</option><option>en</option><option>ko</option><option>ja</option>
+    <option>zh</option><option>ru</option><option>es</option><option>fr</option><option>de</option>
+    <option>ar</option><option>pt</option><option>it</option><option>uk</option><option>fa</option></datalist>
+</section>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+function asrLine(d) {
+  const h = d.asr_health;
+  if (!h) return `ASR: <b>${esc(d.asr_backend)}</b>`;
+  const state = h.ok === false ? `<span class="bad">unreachable</span>`
+    : h.fallback_active ? `<span class="warn">up, but fallback active</span>`
+    : `<span class="ok">up</span>`;
+  const model = h.model ? ` · ${esc(h.model)}` : "";
+  const err = h.error ? ` · <span class="bad">${esc(h.error)}</span>` : "";
+  return `Mac ASR ${esc(h.url)}: ${state}${model}${err}`;
+}
+
+const SKIPS = {
+  asr_busy: "skipped: the Mac stayed busy until the caption would have been late",
+  asr_down: "skipped: the Mac was unreachable until the caption would have been late",
+  asr_unsupported: "skipped: the Mac runs the old API (Korean only); update its asr.py and asr_server.py",
+  asr_error: "skipped: ASR returned an error",
+};
+
+function card(id, c) {
+  const s = c.session;
+  const live = !!s;
+  const chips = [];
+  chips.push(`<span class="chip">${c.clients} client${c.clients === 1 ? "" : "s"}</span>`);
+  if (s) {
+    const inputCls = s.input === "streaming" ? "ok" : "warn";
+    chips.push(`<span class="chip ${inputCls}">${esc(s.input)}</span>`);
+    if (s.asr_used) {
+      const used = s.asr_used === "fallback" ? `<span class="warn">fallback (CPU)</span>`
+        : (s.asr_used === "primary" || s.asr_used === "remote") ? `<span class="ok">Mac</span>` : esc(s.asr_used);
+      chips.push(`<span class="chip">ASR ${used}</span>`);
+    }
+    if (s.asr_last_s != null) chips.push(`<span class="chip kv">last chunk ${s.asr_last_s.toFixed(2)} s</span>`);
+    if (s.asr_rtf != null) chips.push(`<span class="chip kv">RTF ${s.asr_rtf}</span>`);
+    if (s.lead_s != null) chips.push(`<span class="chip kv">lead ${s.lead_s} s</span>`);
+    if (s.language) chips.push(`<span class="chip">${esc(s.language)} → ${s.task === "transcribe" ? "transcribe" : "translate to en" + (s.mt ? " (" + esc(s.mt) + ")" : "")}</span>`);
+    if (s.captions_mode) chips.push(`<span class="chip">captions: ${esc(s.captions_mode)}</span>`);
+    if (s.video_codec && s.video_codec !== "h264") chips.push(`<span class="chip bad">${esc(s.video_codec)}: no captions</span>`);
+    chips.push(`<span class="chip kv">${s.captions} captions</span>`);
+    if (s.asr_backlog) chips.push(`<span class="chip warn kv">backlog ${s.asr_backlog}</span>`);
+  }
+  const drops = s ? Object.entries(s.dropped || {}).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `<span class="chip kv ${SKIPS[k] ? "warn" : ""}" title="${esc(SKIPS[k] || "")}">${esc(k)} ${v}</span>`).join("") : "";
+  const rows = (c.recent || []).slice().reverse()
+    .map((r) => `<tr><td class="t">${esc(r.time || "")}</td><td>${esc(r.text)}</td></tr>`).join("");
+  return `<section class="card ${live ? "live" : ""}">
+    <h2><span class="dot"></span>${esc(c.name)} <span class="num">#${esc(c.number)} · ${live ? "live" : "idle"}</span></h2>
+    <div class="row">${chips.join("")}</div>
+    ${drops ? `<div class="row"><span class="muted">dropped:</span>${drops}</div>` : ""}
+    ${rows ? `<table>${rows}</table>` : `<div class="muted">No captions yet.</div>`}
+    <div class="row muted"><a href="${esc(c.url)}">${esc(c.url)}</a></div>
+  </section>`;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("status", {cache: "no-store"});
+    const d = await r.json();
+    $("asr").innerHTML = asrLine(d);
+    $("clock").textContent = d.time || "";
+    $("channels").innerHTML = Object.entries(d.channels).map(([id, c]) => card(id, c)).join("");
+    $("err").textContent = "";
+  } catch (e) {
+    $("err").textContent = "relay unreachable";
+  }
+}
+// ---- sources & channels ----
+let conf = {sources: [], channels: []};
+async function api(path, body) {
+  const r = await fetch(path, {method: "POST", body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || r.status);
+  return d;
+}
+function renderCompareDefaults() {
+  const s = conf.settings || {}, mts = s.compare_mts || ["seamless", "nllb", "whisper"];
+  $("cmpdef").innerHTML = "Compare: " + ["seamless", "nllb", "whisper"].map((m) =>
+    `<label><input type="checkbox" data-mt="${m}" ${mts.includes(m) ? "checked" : ""}> ${{seamless: "Seamless", nllb: "NLLB", whisper: "Whisper"}[m]}</label>`).join(" ") +
+    ` <select id="cmph">${[480, 720, 1080].map((v) => `<option value="${v}" ${Number(s.burn_height || 1080) === v ? "selected" : ""}>${v}p</option>`).join("")}</select>`;
+}
+async function saveSettings(changes) {
+  try { conf.settings = await api("api/settings", changes); $("err").textContent = ""; }
+  catch (e) { $("err").textContent = `Save failed: ${e.message}`; }
+}
+$("cmpdef").addEventListener("change", (ev) => {
+  if (ev.target.id === "cmph") return saveSettings({burn_height: Number(ev.target.value)});
+  const mts = [...$("cmpdef").querySelectorAll("[data-mt]")].filter((x) => x.checked).map((x) => x.dataset.mt);
+  if (!mts.length) { ev.target.checked = true; return; }
+  saveSettings({compare_mts: mts});
+});
+function renderLanguages() {
+  const rows = Object.entries(conf.languages || {}).sort((a, b) => (b[1].at || "").localeCompare(a[1].at || ""));
+  const names = Object.fromEntries(conf.channels.map((c) => [c.url, c.name]));
+  $("langs_t").innerHTML = rows.length ? rows.map(([url, v]) => `<tr>
+      <td><b>${esc(v.lang)}</b></td><td>${esc(names[url] || url)}</td>
+      <td class="muted">${esc((v.votes || []).join(" "))}</td><td class="muted">${esc(v.at || "")}</td>
+      <td><button class="b" data-forget="${esc(url)}" title="Detect again on the next tune">forget</button></td></tr>`).join("")
+    : `<tr><td class="muted">none yet</td></tr>`;
+}
+$("langs_t").addEventListener("click", async (ev) => {
+  const url = ev.target.dataset.forget;
+  if (!url) return;
+  try { await api("api/languages/forget", {url}); delete conf.languages[url]; renderLanguages(); }
+  catch (e) { $("err").textContent = `Forget failed: ${e.message}`; }
+});
+$("affmpeg").addEventListener("change", (ev) => saveSettings({audio_ffmpeg: ev.target.value}));
+async function loadConf() {
+  conf = await (await fetch("api/config", {cache: "no-store"})).json();
+  $("affmpeg").value = (conf.settings || {}).audio_ffmpeg || "";
+  renderLanguages();
+  renderCompareDefaults();
+  const sel = $("src"), cur = sel.value;
+  sel.innerHTML = `<option value="">All sources</option>` +
+    conf.sources.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("") +
+    (conf.channels.some((c) => c.source === "manual") ? `<option value="manual">manual</option>` : "");
+  sel.value = cur;
+  $("sources").innerHTML = conf.sources.map((s) => `<div class="row">
+      <span class="chip">${esc(s.name)}</span><span class="muted">${s.count ?? ""} channels (${s.majors ?? 0} major) · updated ${esc(s.updated || "")}</span>
+      <button class="b" data-refresh="${esc(s.url)}" data-name="${esc(s.name)}">Refresh</button>
+      <button class="b" data-remove="${esc(s.id)}">Remove</button></div>`).join("");
+  $("epgupd").textContent = conf.epg_updated ? `(built ${conf.epg_updated})` : "(building…)";
+  const hc = conf.health || {};
+  $("checkmsg").textContent = hc.running && hc.progress ? `checking ${hc.progress[0]}/${hc.progress[1]}…` : "";
+  if (hc.running) setTimeout(loadConf, 3000);
+  renderChannels();
+}
+function healthIcon(h) {
+  if (!h) return `<span class="muted" title="not checked yet">·</span>`;
+  const info = h.ok ? `${h.video || ""} ${h.height ? h.height + "p" : ""} ${h.audio || ""}` : h.error;
+  return `<span class="${h.ok ? "ok" : "bad"}" title="${esc(info)} (checked ${esc(h.checked)})">${h.ok ? "✅" : "❌"}</span>`;
+}
+function renderChannels() {
+  const q = $("q").value.trim().toLowerCase(), src = $("src").value, only = $("only").checked;
+  const majors = $("majors").checked, nogeo = $("nogeo").checked, nobroken = $("nobroken").checked;
+  const list = conf.channels.filter((c) => (!only || c.enabled) && (!src || c.source === src) &&
+    (!majors || c.major || c.enabled) && (!nogeo || c.enabled || !/geo-blocked/i.test(c.name)) &&
+    (!nobroken || c.enabled || !c.health || c.health.ok) &&
+    (!q || `${c.name} ${(c.tvg || {})["group-title"] || ""} ${c.source}`.toLowerCase().includes(q)));
+  list.sort((a, b) => (b.enabled - a.enabled) || ((a.number || 1e9) - (b.number || 1e9)) || a.name.localeCompare(b.name));
+  const shown = list.slice(0, 300);
+  $("count").textContent = `${list.length} match${list.length === 1 ? "" : "es"}` + (list.length > 300 ? " (showing 300)" : "");
+  $("chtable").innerHTML = shown.map((c) => `<tr data-id="${esc(c.id)}">
+      <td><input type="checkbox" data-f="enabled" ${c.enabled ? "checked" : ""}></td>
+      <td><div class="name">${healthIcon(c.health)} ${c.major && c.source !== "manual" ? "★ " : ""}${esc(c.name)}</div><div class="sub">${esc((c.tvg || {})["group-title"] || "")} · ${esc(c.source)}${
+        c.enabled ? ((conf.epg || {})[c.id] ? ` · <span class="ok" title="${esc(conf.epg[c.id])}">guide ✓</span>` : " · no guide") : ""}</div></td>
+      <td class="n"><input data-f="number" inputmode="numeric" placeholder="#" value="${esc(c.number ?? "")}"></td>
+      <td class="l"><input data-f="language" list="langs" value="${esc(c.language || "auto")}" title="Spoken language: auto, or a code like en, ko">${
+        c.language && c.language !== "auto" && !(conf.whisper_langs || []).includes(c.language)
+          ? `<div class="sub bad" title="Whisper cannot recognise this language; no captions">no ASR</div>` : ""}</td>
+      <td><select data-f="captions" title="generate: our subtitles (the source's own captions are removed); source CC: keep the source's own captions if it has them, no ASR">
+        <option value="generate" ${c.captions !== "source" ? "selected" : ""}>CC: generate</option>
+        <option value="source" ${c.captions === "source" ? "selected" : ""}>CC: source</option></select></td>
+      <td><select data-f="cc_position" title="Caption position: bottom, above a news lower third (middle), or top">
+        ${["bottom", "middle", "top"].map((v) => `<option value="${v}" ${(c.cc_position || "bottom") === v ? "selected" : ""}>CC ${v}</option>`).join("")}</select></td>
+      <td><select data-f="vtt_chars" title="Subtitle (WebVTT) line length for the HLS output">
+        ${[[42, "subs: 42 chars"], [32, "subs: 32 chars"], [0, "subs: no breaks"]].map(([v, t]) =>
+          `<option value="${v}" ${Number(c.vtt_chars ?? 42) === v ? "selected" : ""}>${t}</option>`).join("")}</select>
+        <select data-f="vtt_lines" title="Subtitle lines per cue">
+        ${[1, 2, 3].map((v) => `<option value="${v}" ${Number(c.vtt_lines ?? 2) === v ? "selected" : ""}>${v} line${v > 1 ? "s" : ""}</option>`).join("")}</select>
+        <label title="Whole sentences per subtitle: each sentence starts a new cue, and a sentence cut off at the end of a chunk waits for the rest"><input type="checkbox" data-f="sentences" ${c.sentences !== false ? "checked" : ""}> sentences</label></td>
+      <td><label title="Compare translation backends: the channel's video is re-encoded with the chosen backends' subtitles burned in, one colour band each (the normal subtitle track stays). Switching takes effect within seconds; re-tune the channel if the picture stalls. Every extra backend costs Mac time: with all three on, the Mac carries about one channel."><input type="checkbox" data-f="compare" ${c.compare ? "checked" : ""}> Compare</label>${c.compare ? `
+        <div class="sub"><label title="Also offer each backend as a plain subtitle sub-channel (N.1, N.2, ...), since Channels DVR passes only one subtitle track per channel"><input type="checkbox" data-f="compare_channels" ${c.compare_channels ? "checked" : ""}> soft .1–.3</label>
+        · costs Mac time; re-tune after switching</div>` : ""}</td>
+      <td><label title="Embed CEA-608/708 closed captions in the video (besides the WebVTT subtitles)"><input type="checkbox" data-f="eia" ${c.eia === true ? "checked" : ""}> EIA CC</label></td>
+      <td class="adv"><select data-f="cc_layout" title="Caption rows: balanced = two rows of similar length; fill = first row full; single = one row per caption">
+        ${["balanced", "fill", "single"].map((v) => `<option value="${v}" ${(c.cc_layout || "balanced") === v ? "selected" : ""}>rows: ${v}</option>`).join("")}</select></td>
+      <td class="adv"><select data-f="cc_center" title="708 centring: pad = invisible leading spaces (works in players that ignore positioning, e.g. Apple TV); native = window justify + pen column">
+        ${[["nbtsp", "centre: 708 NBTSP"], ["pad", "centre: spaces"], ["visible", "centre: black pad"], ["underscore", "centre: black underscores"], ["underscore_all", "centre: underscores everywhere"],
+           ["native", "centre: native"], ["608only", "608 only (no 708)"]].map(([v, t]) =>
+          `<option value="${v}" ${(c.cc_center || "nbtsp") === v ? "selected" : ""}>${t}</option>`).join("")}</select></td>
+      <td><label title="Translate this channel's programme guide to English"><input type="checkbox" data-f="translate_guide" ${c.translate_guide !== false ? "checked" : ""}> EPG en</label></td>
+      <td><select data-f="mt" title="Translation: Seamless translates speech directly (best, the default); NLLB translates Whisper's transcript; Whisper translates directly">
+        <option value="seamless" ${!c.mt || c.mt === "seamless" ? "selected" : ""}>MT: Seamless</option>
+        <option value="nllb" ${c.mt === "nllb" ? "selected" : ""}>MT: NLLB</option>
+        <option value="whisper" ${c.mt === "whisper" ? "selected" : ""}>MT: Whisper</option></select></td>
+    </tr>`).join("");
+}
+async function save(id, field, value) {
+  try {
+    const c = await api(`api/channels/${encodeURIComponent(id)}`, {[field]: value});
+    Object.assign(conf.channels.find((x) => x.id === id), c);
+    $("err").textContent = "";
+    if (field === "enabled" || field === "compare") renderChannels();
+  } catch (e) { $("err").textContent = `Save failed: ${e.message}`; }
+}
+$("chtable").addEventListener("change", (ev) => {
+  const t = ev.target, row = t.closest("tr"), id = row.dataset.id, f = t.dataset.f;
+  save(id, f, t.type === "checkbox" ? t.checked : t.value);
+});
+$("adv").addEventListener("change", () => $("chtable").classList.toggle("showadv", $("adv").checked));
+for (const id of ["q", "src", "only", "majors", "nogeo", "nobroken"]) $(id).addEventListener("input", renderChannels);
+$("add").addEventListener("click", async () => {
+  $("addmsg").textContent = "Fetching…";
+  try {
+    const d = await api("api/sources", {spec: $("spec").value});
+    $("addmsg").textContent = `${d.source.name}: ${d.added} new channels`;
+    $("spec").value = ""; $("src").value = d.source.id; await loadConf();
+  } catch (e) { $("addmsg").textContent = `Failed: ${e.message}`; }
+});
+$("check").addEventListener("click", async () => {
+  await api("api/check", {}); $("checkmsg").textContent = "checking…"; setTimeout(loadConf, 2000);
+});
+$("sources").addEventListener("click", async (ev) => {
+  const t = ev.target;
+  try {
+    if (t.dataset.refresh) { const d = await api("api/sources", {spec: t.dataset.refresh, name: t.dataset.name});
+      $("addmsg").textContent = `${d.source.name}: ${d.added} new channels`; }
+    if (t.dataset.remove && confirm("Remove this source and its channels that are not enabled?"))
+      await api("api/sources/remove", {id: t.dataset.remove});
+    await loadConf();
+  } catch (e) { $("err").textContent = e.message; }
+});
+function tab(name) {
+  $("tab-live").classList.toggle("on", name === "live");
+  $("tab-manage").classList.toggle("on", name === "manage");
+  $("channels").style.display = name === "live" ? "" : "none";
+  $("manage").style.display = name === "manage" ? "block" : "none";
+  if (name === "manage") loadConf();
+  try { localStorage.setItem("tab", name); } catch (e) {}
+}
+$("tab-live").onclick = () => tab("live");
+$("tab-manage").onclick = () => tab("manage");
+let start = "live";
+try { start = localStorage.getItem("tab") || "live"; } catch (e) {}
+tab(start);
+
+refresh();
+setInterval(() => { if ($("manage").style.display !== "block") refresh(); }, 2500);
+</script>
+</body>
+</html>

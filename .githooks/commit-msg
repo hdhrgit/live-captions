@@ -1,0 +1,6 @@
+#!/bin/sh
+# Refuses a commit message with something personal in it.
+if ! "$(dirname "$0")/check.sh" text "$1"; then
+	echo "commit-msg: fix the message above, or commit with --no-verify." >&2
+	exit 1
+fi

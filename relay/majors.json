@@ -1,0 +1,549 @@
+{
+ "_comment": "Major national networks per iptv-org country code. Each entry is a case-insensitive regex matched against the channel name at a word boundary, or 'id:<TvgIdStem>' to match the iptv-org tvg-id exactly. '_extra' pulls named channels from another country's list when this country is added; '_language' sets a default spoken language by tvg-id stem. Edit freely.",
+ "_extra": {
+  "ir": [
+   "uk:IranInternational"
+  ],
+  "ae": [
+   "fr:France24@Arabic",
+   "sa:AlArabiyaEnglish"
+  ],
+  "qa": [
+   "qa:AlJazeera"
+  ]
+ },
+ "_language": {
+  "RudawTV": "ku",
+  "Kurdistan24": "ku",
+  "TRTArabi": "ar",
+  "PressTV": "en",
+  "AlArabiyaEnglish": "en",
+  "AlJazeeraEnglish": "en",
+  "i24NEWSEnglish": "en",
+  "TRTWorld": "en",
+  "IranInternational": "fa",
+  "SkyNewsArabia": "ar",
+  "Alarabiya": "ar",
+  "AlJazeera": "ar",
+  "France24.fr@Arabic": "ar"
+ },
+ "kp": [
+  "KCTV",
+  "Korean Central",
+  "Ryongnamsan",
+  "Sports Television",
+  "Mansudae"
+ ],
+ "kr": [
+  "KBS ?1",
+  "KBS ?2",
+  "KBS World",
+  "KBS News",
+  "MBC",
+  "SBS",
+  "EBS",
+  "JTBC",
+  "MBN",
+  "TV Chosun",
+  "Channel A",
+  "YTN",
+  "Yonhap",
+  "Arirang"
+ ],
+ "jp": [
+  "NHK",
+  "Nippon TV",
+  "NTV",
+  "TBS",
+  "Fuji TV",
+  "TV Asahi",
+  "TV Tokyo",
+  "ANN News"
+ ],
+ "cn": [
+  "CCTV-?1\\b",
+  "CCTV-?4",
+  "CCTV-?13",
+  "CGTN",
+  "Phoenix",
+  "Dragon TV",
+  "Hunan TV",
+  "Zhejiang TV",
+  "Jiangsu TV",
+  "Beijing TV"
+ ],
+ "tw": [
+  "TTV",
+  "CTV",
+  "CTS",
+  "FTV",
+  "PTS",
+  "TVBS",
+  "SET News",
+  "CTi"
+ ],
+ "hk": [
+  "TVB",
+  "ViuTV",
+  "RTHK",
+  "Phoenix"
+ ],
+ "ru": [
+  "Channel One",
+  "Pervyy",
+  "Первый",
+  "Russia ?1",
+  "Rossiya ?1",
+  "Россия ?1",
+  "Russia ?24",
+  "Россия ?24",
+  "NTV",
+  "НТВ",
+  "RT\\b",
+  "RT News",
+  "Zvezda",
+  "Звезда",
+  "TV Centre",
+  "ТВ Центр",
+  "5 Kanal",
+  "Пятый канал",
+  "REN TV"
+ ],
+ "ua": [
+  "1\\+1",
+  "Inter",
+  "ICTV",
+  "STB",
+  "Ukraine 24",
+  "Suspilne",
+  "UA:? Pershyi",
+  "Freedom",
+  "Rada"
+ ],
+ "by": [
+  "Belarus ?1",
+  "Belarus ?24",
+  "ONT",
+  "STV"
+ ],
+ "de": [
+  "Das Erste",
+  "ARD",
+  "ZDF",
+  "tagesschau",
+  "phoenix",
+  "WDR",
+  "NDR",
+  "BR Fernsehen",
+  "SWR",
+  "MDR",
+  "hr-fernsehen",
+  "rbb",
+  "3sat",
+  "arte",
+  "DW",
+  "Welt",
+  "n-tv",
+  "RTL",
+  "Sat\\.?1",
+  "ProSieben",
+  "VOX"
+ ],
+ "at": [
+  "ORF",
+  "ServusTV",
+  "Puls 24"
+ ],
+ "ch": [
+  "SRF",
+  "RTS",
+  "RSI"
+ ],
+ "fr": [
+  "TF1",
+  "France ?2",
+  "France ?3",
+  "France ?5",
+  "France 24",
+  "franceinfo",
+  "BFM ?TV",
+  "CNews",
+  "LCI",
+  "M6",
+  "Arte",
+  "TV5",
+  "LCP",
+  "Public S[eé]nat"
+ ],
+ "be": [
+  "VRT",
+  "RTBF",
+  "La Une",
+  "VTM",
+  "LN24"
+ ],
+ "nl": [
+  "NPO ?1",
+  "NPO ?2",
+  "NPO ?3",
+  "RTL ?4",
+  "NOS"
+ ],
+ "uk": [
+  "BBC",
+  "ITV",
+  "Channel 4",
+  "Channel 5",
+  "Sky News",
+  "GB News",
+  "TalkTV",
+  "S4C",
+  "STV"
+ ],
+ "ie": [
+  "RT[EÉ]",
+  "Virgin Media One",
+  "TG4"
+ ],
+ "it": [
+  "Rai ?1",
+  "Rai ?2",
+  "Rai ?3",
+  "Rai ?News",
+  "Canale 5",
+  "Italia ?1",
+  "Rete ?4",
+  "La7",
+  "Sky TG24",
+  "TGCom ?24"
+ ],
+ "es": [
+  "La 1",
+  "La 2",
+  "24h",
+  "Antena 3",
+  "Cuatro",
+  "Telecinco",
+  "laSexta",
+  "TVE",
+  "RTVE"
+ ],
+ "pt": [
+  "RTP ?1",
+  "RTP ?2",
+  "RTP ?3",
+  "SIC",
+  "TVI",
+  "CNN Portugal"
+ ],
+ "pl": [
+  "TVP ?1",
+  "TVP ?2",
+  "TVP ?Info",
+  "TVN",
+  "TVN ?24",
+  "Polsat",
+  "Polsat News"
+ ],
+ "cz": [
+  "ČT ?1",
+  "CT ?1",
+  "ČT24",
+  "CT24",
+  "Nova",
+  "Prima"
+ ],
+ "hu": [
+  "M1",
+  "Duna",
+  "RTL",
+  "TV2",
+  "ATV"
+ ],
+ "ro": [
+  "TVR ?1",
+  "Pro TV",
+  "Antena 1",
+  "Digi24",
+  "Realitatea"
+ ],
+ "gr": [
+  "ERT",
+  "Mega",
+  "ANT1",
+  "Alpha",
+  "Skai",
+  "Star"
+ ],
+ "tr": [
+  "id:TRT1",
+  "id:TRTHaber",
+  "id:ATV",
+  "id:KanalD",
+  "id:StarTV",
+  "id:NOW",
+  "id:TV8",
+  "id:HaberturkTV",
+  "id:NTV",
+  "id:AHaber",
+  "id:TRTArabi",
+  "id:TRTWorld",
+  "id:Show",
+  "id:CNNTurk"
+ ],
+ "ir": [
+  "id:IRINN",
+  "id:PressTV",
+  "id:IranInternational",
+  "id:IRIB1",
+  "id:IRIB2",
+  "id:IRIB3",
+  "id:ManotoTV",
+  "IRIB",
+  "IRINN",
+  "Press TV",
+  "Iran International",
+  "Manoto",
+  "BBC Persian"
+ ],
+ "il": [
+  "id:Kan11",
+  "id:Keshet12",
+  "id:Channel13",
+  "id:Now14",
+  "id:i24NEWSHebrew",
+  "id:i24NEWSEnglish",
+  "id:KnessetChannel"
+ ],
+ "sa": [
+  "id:AlSaudiya",
+  "id:AlEkhbariya",
+  "id:AlHadath",
+  "id:AsharqNews",
+  "id:AlArabiya",
+  "id:AlArabiyaEnglish",
+  "Al Arabiya"
+ ],
+ "ae": [
+  "id:Alarabiya",
+  "id:SkyNewsArabia",
+  "id:MBC1",
+  "id:DubaiTVInternational",
+  "id:AbuDhabiTV",
+  "id:AlArabiyaBusiness",
+  "Al Arabiya",
+  "Sky News Arabia",
+  "Abu Dhabi",
+  "MBC ?1\\b"
+ ],
+ "qa": [
+  "id:AlJazeera",
+  "id:AlJazeeraEnglish",
+  "id:AlJazeeraMubasher",
+  "id:QatarTelevision",
+  "Al Jazeera",
+  "Qatar Television"
+ ],
+ "eg": [
+  "id:MBCMasr",
+  "id:MBC1Egypt",
+  "id:AlKaheraWalNas",
+  "id:ExtraNews",
+  "id:CBC",
+  "id:ONE",
+  "Al Kahera",
+  "Extra News",
+  "Nile"
+ ],
+ "in": [
+  "DD National",
+  "DD News",
+  "Aaj Tak",
+  "NDTV",
+  "Republic",
+  "Times Now",
+  "India Today",
+  "Zee News",
+  "ABP News",
+  "WION",
+  "CNN-News18"
+ ],
+ "pk": [
+  "PTV",
+  "Geo News",
+  "ARY News",
+  "Dunya",
+  "Samaa",
+  "Express News"
+ ],
+ "id": [
+  "TVRI",
+  "RCTI",
+  "SCTV",
+  "Indosiar",
+  "Trans ?7",
+  "Trans TV",
+  "Metro TV",
+  "Kompas TV",
+  "tvOne",
+  "CNN Indonesia"
+ ],
+ "ph": [
+  "GMA",
+  "ABS-CBN",
+  "TV5",
+  "PTV",
+  "ANC",
+  "One News"
+ ],
+ "vn": [
+  "VTV",
+  "HTV"
+ ],
+ "th": [
+  "Thai PBS",
+  "Channel 3",
+  "Channel 7",
+  "Ch3",
+  "Ch7",
+  "MCOT",
+  "NBT",
+  "Workpoint"
+ ],
+ "us": [
+  "ABC News",
+  "CBS News",
+  "NBC News",
+  "CNN\\b",
+  "Fox News",
+  "LiveNOW",
+  "MSNBC",
+  "Bloomberg",
+  "C-SPAN",
+  "PBS",
+  "Newsmax",
+  "NewsNation",
+  "Scripps News",
+  "Court TV",
+  "Reuters"
+ ],
+ "ca": [
+  "CBC",
+  "CTV",
+  "Global News",
+  "CPAC",
+  "TVA",
+  "Radio-Canada",
+  "ICI RDI",
+  "CityNews"
+ ],
+ "mx": [
+  "Las Estrellas",
+  "Canal 5",
+  "Azteca",
+  "Imagen",
+  "Milenio",
+  "Foro TV",
+  "Canal 22",
+  "Canal Once"
+ ],
+ "br": [
+  "Globo",
+  "SBT",
+  "Record",
+  "Band",
+  "CNN Brasil",
+  "GloboNews",
+  "TV Cultura",
+  "Jovem Pan"
+ ],
+ "ar": [
+  "Telefe",
+  "El Trece",
+  "Canal 13",
+  "TV P[uú]blica",
+  "TN\\b",
+  "C5N",
+  "A24",
+  "LN\\+"
+ ],
+ "cl": [
+  "TVN",
+  "Canal 13",
+  "Mega",
+  "Chilevisi[oó]n",
+  "24 Horas"
+ ],
+ "co": [
+  "Caracol",
+  "RCN",
+  "Canal 1",
+  "Se[nñ]al Colombia"
+ ],
+ "au": [
+  "ABC",
+  "SBS",
+  "Seven",
+  "7News",
+  "Nine",
+  "9News",
+  "Network 10",
+  "10 News",
+  "Sky News Australia"
+ ],
+ "nz": [
+  "TVNZ",
+  "1News",
+  "Three",
+  "Newshub",
+  "Whakaata M[aā]ori"
+ ],
+ "za": [
+  "SABC",
+  "eNCA",
+  "e\\.tv",
+  "Newzroom Afrika"
+ ],
+ "ng": [
+  "NTA",
+  "Channels TV",
+  "TVC News",
+  "Arise News",
+  "AIT"
+ ],
+ "iq": [
+  "id:AlIraqia",
+  "id:AlIraqiaNews",
+  "id:AlSharqiya",
+  "id:AlSharqiyaNews",
+  "id:DijlahTV",
+  "id:UTV",
+  "id:AlRasheedTV",
+  "id:RudawTV",
+  "id:Kurdistan24"
+ ],
+ "lb": [
+  "id:LBC",
+  "id:LBCInternational",
+  "id:TeleLiban",
+  "id:MTVLebanon",
+  "id:AlJadeed",
+  "id:OTV",
+  "id:AlManar",
+  "id:AlMayadeenTV",
+  "LBCI"
+ ],
+ "sy": [
+  "id:AlSouriyaTV",
+  "id:AlikhbariaSyria",
+  "id:SyriaTV"
+ ],
+ "jo": [
+  "id:JordanTV",
+  "id:RoyaTV"
+ ],
+ "kw": [
+  "id:KTV1",
+  "id:KTVNews"
+ ]
+}

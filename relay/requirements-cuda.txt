@@ -1,0 +1,6 @@
+# asr_server.py on a Linux box with an NVIDIA GPU (ASR_BACKEND=cuda), not
+# the relay. Untested; see docs/NVIDIA.md.
+-r requirements.txt
+faster-whisper==1.2.1
+torch
+transformers

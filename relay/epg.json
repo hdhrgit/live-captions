@@ -1,0 +1,168 @@
+{
+ "_comment": "XMLTV guide files per iptv-org country code (epgshare01.online files unless a full URL), tried in order. 'aliases' maps a playlist tvg-id stem to guide channel ids or display names when names differ (e.g. Hebrew). Arab countries also use the pan-Arab files.",
+ "base": "https://epgshare01.online/epgshare01/epg_ripper_{}.xml.gz",
+ "countries": {
+  "il": [
+   "IL1"
+  ],
+  "tr": [
+   "TR3",
+   "TR1"
+  ],
+  "eg": [
+   "EG1",
+   "AE1"
+  ],
+  "sa": [
+   "SA2",
+   "AE1",
+   "EG1"
+  ],
+  "ae": [
+   "AE1",
+   "EG1"
+  ],
+  "qa": [
+   "ALJAZEERA1",
+   "AE1",
+   "EG1",
+   "BEIN1"
+  ],
+  "iq": [
+   "AE1",
+   "EG1"
+  ],
+  "ir": [
+   "AE1"
+  ],
+  "lb": [
+   "AE1",
+   "EG1"
+  ],
+  "sy": [
+   "AE1",
+   "EG1"
+  ],
+  "jo": [
+   "AE1",
+   "EG1"
+  ],
+  "kw": [
+   "AE1",
+   "EG1"
+  ],
+  "uk": [
+   "UK1"
+  ],
+  "us": [
+   "US2"
+  ],
+  "de": [
+   "DE1"
+  ],
+  "fr": [
+   "FR1"
+  ],
+  "it": [
+   "IT1"
+  ],
+  "es": [
+   "ES1"
+  ],
+  "kr": [
+   "KR1"
+  ],
+  "jp": [
+   "JP1",
+   "JP2"
+  ],
+  "in": [
+   "IN1",
+   "IN2"
+  ],
+  "au": [
+   "AU1"
+  ],
+  "ca": [
+   "CA2"
+  ],
+  "ua": [
+   "UA1"
+  ],
+  "pl": [
+   "PL1"
+  ],
+  "nl": [
+   "NL1"
+  ],
+  "pt": [
+   "PT1"
+  ],
+  "gr": [
+   "GR1"
+  ],
+  "ro": [
+   "RO1"
+  ],
+  "cn": [
+   "HK1"
+  ],
+  "ru": [
+   "https://iptvx.one/epg/epg_lite.xml.gz"
+  ]
+ },
+ "aliases": {
+  "Kan11": [
+   "כאן 11",
+   "ערוץ 11 כאן שידור חי"
+  ],
+  "Keshet12": [
+   "ערוץ 12 שידור חי",
+   "קשת"
+  ],
+  "Channel13": [
+   "רשת"
+  ],
+  "Now14": [
+   "ערוץ 14 HD",
+   "ערוץ 14 שידור חי"
+  ],
+  "i24NEWSHebrew": [
+   "עברית i24"
+  ],
+  "i24NEWSEnglish": [
+   "i24NEWS ENGLISH"
+  ],
+  "i24NEWSArabic": [
+   "i24NEWS ARABIC"
+  ],
+  "KnessetChannel": [
+   "ערוץ הכנסת"
+  ],
+  "LBCInternational": [
+   "LBCI"
+  ],
+  "ChannelOne": [
+   "Первый канал",
+   "pervy"
+  ],
+  "Russia1": [
+   "Россия 1",
+   "rossia1"
+  ],
+  "Russia24": [
+   "Россия 24",
+   "rossia-24"
+  ],
+  "NTV": [
+   "НТВ",
+   "ntv"
+  ],
+  "CCTV1": [
+   "CCTV-1"
+  ],
+  "CCTV13": [
+   "CCTV-13"
+  ]
+ }
+}
