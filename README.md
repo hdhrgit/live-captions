@@ -199,8 +199,8 @@ With `ARCHIVE_DIR` set, the relay keeps the last `ARCHIVE_MINUTES` of ASR chunks
 The relay's `remote` backend sends each audio chunk (6 to 12 s) as one request.
 Any service that implements these two endpoints works. `relay/asr_server.py`
 implements them with `ASR_BACKEND=mlx` (mlx-whisper on Apple Silicon; see
-`mac/` and INSTALL.md) or, untested, `ASR_BACKEND=cuda` on an NVIDIA GPU
-(docs/NVIDIA.md). The relay itself does no speech recognition.
+`mac/` and INSTALL.md) or `ASR_BACKEND=cuda` on an NVIDIA GPU (tested on an RTX 3060;
+docs/NVIDIA.md). The relay itself does no speech recognition.
 
 ### `POST /v1/translate?language=ko`
 

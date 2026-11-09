@@ -8,7 +8,7 @@
   GET /health -> {"ok": true, "api": 3, "mt": [...], "backend": ..., "model": ...}
 
 ASR_BACKEND=mlx uses mlx-whisper on Apple Silicon (see mac/);
-ASR_BACKEND=cuda uses faster-whisper on an NVIDIA GPU (untested, see
+ASR_BACKEND=cuda uses faster-whisper on an NVIDIA GPU (tested on an RTX 3060, see
 docs/NVIDIA.md).
 """
 import io

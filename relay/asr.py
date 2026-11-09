@@ -388,7 +388,7 @@ def speech_ratio(audio):
 
 class CudaWhisper(Whisper):
     """faster-whisper on an NVIDIA GPU (ASR_BACKEND=cuda, for asr_server.py on
-    a Linux box; untested, see docs/NVIDIA.md). The model is loaded once."""
+    a Linux box; tested on an RTX 3060, see docs/NVIDIA.md). The model is loaded once."""
 
     _model = None
     _lock = threading.Lock()

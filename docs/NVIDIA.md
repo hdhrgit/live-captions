@@ -1,7 +1,7 @@
-# ASR server on an NVIDIA GPU (untested)
+# ASR server on an NVIDIA GPU
 
-Untested: written from the code, not run. Reports and fixes from anyone with
-an NVIDIA card are welcome.
+Tested on an RTX 3060 12 GB. Reports and fixes from anyone with other NVIDIA
+cards are welcome.
 
 The relay does no speech recognition itself; it sends audio to an ASR server
 over HTTP (README, "ASR HTTP contract"). On a Mac that's `mac/install.sh`.
@@ -24,6 +24,9 @@ python3 -m venv ~/captions-asr && . ~/captions-asr/bin/activate
 pip install -r relay/requirements-cuda.txt   # a CUDA build of torch may need the
                                              # index URL from pytorch.org
 cd relay
+# faster-whisper (CTranslate2) needs the CUDA libraries that come with torch:
+SP=$(python -c "import site; print(site.getsitepackages()[0])")
+export LD_LIBRARY_PATH=$(ls -d $SP/nvidia/*/lib | tr "\n" ":")$LD_LIBRARY_PATH
 ASR_BACKEND=cuda SEAMLESS_MODEL=/models/seamless-m4t-v2-large \
   NLLB_MODEL=/models/nllb-200-distilled-1.3B-ct2 NLLB_DEVICE=cuda \
   PORT=8096 python asr_server.py
