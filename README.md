@@ -254,12 +254,15 @@ Returns `200 {"ok": true, "model": "..."}`.
 
 ### Docker (a Docker host)
 
+The relay image (amd64 and arm64):
+
 ```sh
-docker compose up -d --build      # relay with local ASR on :8095
-docker compose --profile asr up -d   # also the reference ASR server on :8096
+docker pull ghcr.io/hdhrgit/live-captions:latest
 ```
 
-Models are cached in the `captions-models` volume.
+Or build it with compose: put `PUBLIC_URL` and `ASR_URL` in a `.env` next to
+`compose.yaml`, then `docker compose up -d`. The guide translation's NLLB
+model is read from the `captions-models` volume (`/models`).
 
 ### Native systemd service (Channels DVR box)
 
