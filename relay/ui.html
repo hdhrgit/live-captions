@@ -61,9 +61,11 @@
 <header>
   <h1>captions-dvr</h1>
   <span id="asr" class="kv"></span>
+  <div id="epgmodel" class="muted"></div>
   <span class="muted kv" id="clock"></span>
-  <span class="muted"><a href="playlist.m3u">playlist.m3u</a> · <a href="status">status JSON</a></span>
+  <span class="muted"><a href="playlist.m3u">playlist.m3u</a> · <a href="status">status JSON</a> · <span id="version"></span></span>
   <span id="err"></span>
+  <div id="banner" class="bad" style="font-weight:bold"></div>
 </header>
 <nav><button id="tab-live" class="on">Live</button><button id="tab-manage">Sources &amp; channels</button></nav>
 <main id="channels"></main>
@@ -86,6 +88,8 @@
     <button class="b" id="check">Check streams</button> <span id="checkmsg" class="muted"></span>
     <label><input type="checkbox" id="only"> enabled only</label>
     <label title="Show the 608/708 caption layout options (rows, centring); WebVTT subtitles don't need them"><input type="checkbox" id="adv"> Advanced (608/708)</label>
+    <label title="Requests the speech server gets at once, across channels: 1 for the Mac (its GPU runs one at a time), 8-16 for an NVIDIA server (it decodes them in batches)">ASR parallel <select id="asrpar"></select></label>
+    <label title="Keeps each chunk's audio and ASR result for ARCHIVE_MINUTES (debugging). Costs CPU and disk for every running channel."><input type="checkbox" id="archive"> Keep audio archive</label>
     <label title="An ffmpeg binary that can decode AC-4 audio (ATSC 3.0), path inside the relay; empty: such channels can't be captioned"><input id="affmpeg" size="22" placeholder="audio ffmpeg (AC-4)"></label>
     <span id="cmpdef" title="Compare defaults: the backends burned into a channel in Compare mode (here and for /api/stream?compare=1), and the video resolution. Every extra backend costs Mac time."></span>
     <span id="count" class="muted"></span>
@@ -154,13 +158,28 @@ function card(id, c) {
   </section>`;
 }
 
+function epgModelLine(m) {
+  // Guide translator (EPG_TRANSLATE=1 in the env file); nothing when it's off.
+  if (!m || m.state === "off") return "";
+  if (m.state === "downloading") return `Guide translator: downloading ${m.percent || 0}% (${m.mb_done || 0} of ${m.mb_total} MB)`;
+  if (m.state === "verifying") return "Guide translator: checking the download...";
+  if (m.state === "waiting") return `Guide translator: download interrupted (${m.error}); retrying at ${m.next_retry}`;
+  if (m.state === "failed") return `Guide translator: download failed (${m.error}); will retry at the next guide refresh, or run captions-dvr-get-nllb now`;
+  if (m.state === "missing") return "Guide translator: not downloaded yet (starts with the next guide refresh)";
+  return "";
+}
 async function refresh() {
   try {
     const r = await fetch("status", {cache: "no-store"});
     const d = await r.json();
     $("asr").innerHTML = asrLine(d);
+    const h = d.asr_health;
+    $("banner").textContent = (d.config_problems || []).concat(
+      h && h.ok === false ? [`Speech server unreachable at ${h.url}: no captions`] : []).join(" · ");
+    $("epgmodel").textContent = epgModelLine(d.epg_model);
     $("clock").textContent = d.time || "";
-    $("channels").innerHTML = Object.entries(d.channels).map(([id, c]) => card(id, c)).join("");
+    $("channels").innerHTML = Object.entries(d.channels).map(([id, c]) => card(id, c)).join("") ||
+      `<p class="muted">No channels yet: add a source below (a country from iptv-org, or paste an M3U URL), then enable channels.</p>`;
     $("err").textContent = "";
   } catch (e) {
     $("err").textContent = "relay unreachable";
@@ -206,9 +225,15 @@ $("langs_t").addEventListener("click", async (ev) => {
   catch (e) { $("err").textContent = `Forget failed: ${e.message}`; }
 });
 $("affmpeg").addEventListener("change", (ev) => saveSettings({audio_ffmpeg: ev.target.value}));
+$("archive").addEventListener("change", (ev) => saveSettings({archive: ev.target.checked}));
+$("asrpar").addEventListener("change", (ev) => saveSettings({asr_parallel: Number(ev.target.value)}));
 async function loadConf() {
   conf = await (await fetch("api/config", {cache: "no-store"})).json();
+  $("version").textContent = conf.version ? `captions-dvr ${conf.version}` : "";
   $("affmpeg").value = (conf.settings || {}).audio_ffmpeg || "";
+  $("archive").checked = !!(conf.settings || {}).archive;
+  $("asrpar").innerHTML = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32].map((n) =>
+    `<option value="${n}" ${Number((conf.settings || {}).asr_parallel || 1) === n ? "selected" : ""}>${n}</option>`).join("");
   renderLanguages();
   renderCompareDefaults();
   const sel = $("src"), cur = sel.value;

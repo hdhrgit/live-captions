@@ -1,4 +1,4 @@
-"""captions-dvr relay: HLS in, MPEG-TS with CEA-608 English captions out.
+"""captions-dvr relay: live TV in, HLS with English WebVTT subtitles out.
 
 Each channel runs on demand: the first client starts a session, and the
 session stops GRACE seconds after the last client leaves. A session has
@@ -6,22 +6,29 @@ three threads:
   input  - demuxes the HLS source, normalizes timestamps, queues packets for
            output and decodes audio for ASR
   asr    - cuts audio at quiet points, sends it to the ASR backend and turns
-           guarded segments into CEA-608 cues
-  output - paces packets out about DELAY seconds behind the source, inserts
-           caption SEI into each video access unit (no re-encode) and muxes
-           MPEG-TS
-The HTTP server serves /<id>.ts per channel, /playlist.m3u and /status.
+           guarded segments into subtitle cues
+  output - paces packets out about DELAY seconds behind the source (with
+           CEA-608 in the video if the channel has "EIA CC" on, no re-encode)
+           and muxes MPEG-TS, which hls.Segmenter cuts into HLS segments
+The HTTP server serves /playlist.m3u (HLS with WebVTT subtitles) and /status.
+
+Each running channel lives in its own worker process (ChannelWorker, started
+on the first request, gone once idle): the front process serves the web
+page, playlists and settings, proxies a channel's requests to its worker,
+and queues every worker's ASR requests (ASRGate).
 """
 import collections
 import contextlib
+import fcntl
+import http.client
 import heapq
 import io
 import json
 import logging
 import os
 import queue
-import shutil
 import subprocess
+import sys
 import threading
 import re
 import time
@@ -42,6 +49,7 @@ import config
 import epg
 import health
 import hls
+import nllbget
 import slate
 
 DELAY = float(os.environ.get("DELAY", "20"))
@@ -63,8 +71,9 @@ COLD_WAIT = float(os.environ.get("COLD_WAIT", "8"))   # max hold of a playlist r
 GRACE = float(os.environ.get("GRACE", "60"))
 PORT = int(os.environ.get("PORT", "8095"))
 PUBLIC_URL = os.environ.get("PUBLIC_URL", f"http://localhost:{PORT}")
-SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channels.json")
-CHANNELS_FILE = os.environ.get("CHANNELS_FILE", SEED_FILE)
+# Sources, channels and settings (written by the web page); a new install starts empty.
+CHANNELS_FILE = os.environ.get("CHANNELS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                             "channels.json"))
 # ASR chunks: cut at the first speech pause (PAUSE_MS) after CHUNK_MIN
 # seconds, or at the quietest point once CHUNK_MAX is reached.
 CHUNK_MIN = float(os.environ.get("CHUNK_MIN", "4"))
@@ -73,6 +82,12 @@ PAUSE_MS = int(os.environ.get("PAUSE_MS", "300"))
 # A sentence left unfinished at the end of a chunk waits for the next chunk
 # only while its cue would still be at least this far ahead of the output.
 HOLD_MIN_LEAD = float(os.environ.get("HOLD_MIN_LEAD", "15"))
+# Channel option "long_chunks" (stateless: chunk=long): chunks of 20-28 s,
+# nearly filling Whisper's 30 s window, so about a quarter of the encoder
+# passes for the same audio; the video runs this much later to keep captions
+# in time. For recordings; Seamless gains little (its cost follows length).
+LONG_CHUNKS = {"delay": float(os.environ.get("LONG_DELAY", "50")), "min_lead": 35.0,
+               "chunk_min": 20.0, "chunk_max": 28.0}
 STALL = float(os.environ.get("STALL", "60"))
 # 708 centring mode when a channel doesn't set one. Channels DVR showed the
 # WebVTT subtitles with 608 + 708 embedded as well, so keep both by default.
@@ -82,6 +97,8 @@ VTT_CHARS = int(os.environ.get("VTT_CHARS", "42"))   # WebVTT line length (0 = n
 # Channels shows the WebVTT subtitles without it, and EIA added a second
 # (left-aligned on tvOS) caption track.
 EIA_DEFAULT = os.environ.get("EIA", "0") == "1"
+# Where the audio archive goes when the web page's "Keep audio archive" is on
+# (off by default: it costs CPU and disk for every running channel).
 ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", "")
 # Languages detected on "auto" channels, per source URL, so a new session
 # starts with the right one: {url: {"lang", "votes", "at"}}.
@@ -92,36 +109,48 @@ LID_AT_START = 3                                          # and on this many spe
 
 
 class Languages:
-    """The detected-language store (LANG_FILE)."""
+    """The detected-language store (LANG_FILE). Every channel's worker process
+    writes to it: each change re-reads the file under a file lock."""
 
     def __init__(self, path):
         self.path, self.lock = path, threading.Lock()
+
+    @contextlib.contextmanager
+    def locked(self):
+        with self.lock, open(self.path + ".lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    @property
+    def data(self):
         try:
-            with open(path) as f:
-                self.data = json.load(f)
+            with open(self.path) as f:
+                return json.load(f)
         except (OSError, ValueError):
-            self.data = {}
+            return {}
 
     def get(self, url):
-        with self.lock:
-            return dict(self.data.get(url) or {})
+        return dict(self.data.get(url) or {})
 
     def put(self, url, lang, votes):
-        with self.lock:
-            self.data[url] = {"lang": lang, "votes": list(votes), "at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
-            self.save()
+        self.change(url, {"lang": lang, "votes": list(votes),
+                          "at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())})
 
     def forget(self, url):
-        with self.lock:
-            self.data.pop(url, None)
-            self.save()
+        self.change(url, None)
 
-    def save(self):
+    def change(self, url, value):
         try:
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.data, f, indent=1)
-            os.replace(tmp, self.path)
+            with self.locked():
+                data = self.data
+                if value is None:
+                    data.pop(url, None)
+                else:
+                    data[url] = value
+                tmp = f"{self.path}.{os.getpid()}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=1)
+                os.replace(tmp, self.path)
         except OSError as e:
             log.warning("can't save %s: %s", self.path, e)
 
@@ -133,7 +162,58 @@ MUSIC_CAPTION = os.environ.get("MUSIC_CAPTION", "[\u266a music]")
 TICKS = 90000
 SR = asr.SR
 TB = Fraction(1, TICKS)
-GPU_LOCK = threading.Lock()   # one request to the remote ASR (Mac GPU) at a time
+class ASRGate:
+    """How many requests may be at the remote ASR at once, across channels:
+    the relay setting "asr_parallel" or env ASR_PARALLEL, default 1. One
+    suits the Mac (its GPU runs one decode at a time anyway, and concurrent
+    jobs there ran away); an NVIDIA server can take several. Waiters are
+    served earliest deadline first."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.active = 0
+        self.waiting = []   # heap of (due, seq)
+        self.seq = 0
+
+    @staticmethod
+    def limit():
+        try:
+            return max(1, int((cfg.settings if cfg else {}).get("asr_parallel")
+                              or os.environ.get("ASR_PARALLEL", "1")))
+        except (TypeError, ValueError):
+            return 1
+
+    def acquire(self, due, timeout):
+        end = time.monotonic() + timeout
+        with self.cv:
+            self.seq += 1
+            me = (due, self.seq)
+            heapq.heappush(self.waiting, me)
+            try:
+                while not (self.active < self.limit() and self.waiting[0] == me):
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self.cv.wait(left)
+                heapq.heappop(self.waiting)
+                self.active += 1
+                return True
+            finally:
+                if me in self.waiting:   # timed out: leave the queue
+                    self.waiting.remove(me)
+                    heapq.heapify(self.waiting)
+                self.cv.notify_all()
+
+    def release(self):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify_all()
+
+
+GPU_LOCK = ASRGate()
+# The channel id when this process is a channel's worker (relay.py --worker
+# <id>); None in the front process. See ChannelWorker.
+WORKER = None
 VIDEO_PID = 0x100  # libavformat mpegts default for the first stream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
@@ -263,7 +343,13 @@ class Session:
                 channel.cfg, config.channel_countries(channel.cfg, cfg.sources))
         self.lid_checks, self.lid_last = 0, 0.0
         self.burst = BURST   # seconds of backlog released at once on start
+        self.speech_end = None   # ticks: end of the last chunk's speech (add_vtt)
         self.start_delay = START_DELAY   # input_loop: DELAY for sources without a backlog
+        long = channel.cfg.get("long_chunks")
+        self.delay = LONG_CHUNKS["delay"] if long else DELAY
+        self.min_lead = LONG_CHUNKS["min_lead"] if long else MIN_LEAD
+        self.chunk_min = LONG_CHUNKS["chunk_min"] if long else CHUNK_MIN
+        self.chunk_max = LONG_CHUNKS["chunk_max"] if long else CHUNK_MAX
         # New session, new timeline: cues of an earlier session would hold
         # the new ones back (cue starts must keep increasing).
         for cues in channel.vtt_tracks.values():
@@ -303,18 +389,23 @@ class Session:
                 if self.anchor is None and ".m3u" not in url.split("?")[0]:
                     # A plain TS stream (e.g. an HDHomeRun tuner) has no
                     # backlog: build the whole delay up front, under the card.
-                    self.start_delay = DELAY
+                    self.start_delay = self.delay
                 if "live_start_index" not in self.ch.cfg and self.anchor is None:
                     # Start as far back as the delay plus the burst needs.
                     durs = segment_durations(url, headers)
                     if durs:
                         seg = max(durs)
                         k, back = 0, 0.0
-                        while k < len(durs) and back < DELAY + BURST + seg:
+                        while k < len(durs) and back < self.delay + BURST + seg:
                             k += 1
                             back += durs[-k]
                         options["live_start_index"] = str(-k)
                         self.stats["backlog_s"] = round(back, 1)
+                        if self.delay > DELAY:
+                            # Long chunks: what the backlog doesn't cover of the
+                            # longer delay builds up under the card, rather than
+                            # pausing the picture to re-anchor half a minute in.
+                            self.start_delay = max(START_DELAY, self.delay - back)
                 with self.open_source(url, options) as c:
                     v = c.streams.video[0]
                     a = c.streams.audio[0]
@@ -439,10 +530,10 @@ class Session:
                 buf_start = start
             buf.append(samples)
             buf_len += len(samples)
-            if buf_len < CHUNK_MIN * SR:
+            if buf_len < self.chunk_min * SR:
                 continue
             audio = np.concatenate(buf)
-            cut = find_cut(audio)
+            cut = find_cut(audio, self.chunk_min, self.chunk_max)
             if cut is None:
                 buf = [audio]
                 continue
@@ -499,7 +590,7 @@ class Session:
         if not isinstance(backend, asr.Remote):
             return asr.timed(backend, audio, lang, task, mt)
         anchor = self.anchor
-        due = (anchor[0] + (start - anchor[1]) / TICKS) if anchor else time.monotonic() + DELAY / 2
+        due = (anchor[0] + (start - anchor[1]) / TICKS) if anchor else time.monotonic() + self.delay / 2
         t0, pause, reason = time.monotonic(), 0.5, "asr_down"
         while True:
             remaining = due - time.monotonic() - 1.0
@@ -508,14 +599,18 @@ class Session:
                          "busy" if reason == "asr_busy" else "unreachable")
                 raise SkipChunk(reason)
             try:
-                # One Mac request at a time across channels: its GPU decodes
-                # serially anyway, and concurrent GPU jobs ran away before.
-                if not GPU_LOCK.acquire(timeout=max(0.1, remaining - 1)):
-                    raise TimeoutError("waiting for the GPU lane")
-                try:
-                    r = self.call_backend(audio, lang, task, mt, min(remaining, backend.timeout))
-                finally:
-                    GPU_LOCK.release()
+                if WORKER:
+                    # The front process queues it (ASRGate there, across channels).
+                    r = self.call_backend(audio, lang, task, mt, remaining + 2, due)
+                else:
+                    # A limited number of requests at the ASR at once (ASRGate),
+                    # the chunk nearest its deadline first.
+                    if not GPU_LOCK.acquire(due, timeout=max(0.1, remaining - 1)):
+                        raise TimeoutError("waiting for the GPU lane")
+                    try:
+                        r = self.call_backend(audio, lang, task, mt, min(remaining, backend.timeout))
+                    finally:
+                        GPU_LOCK.release()
                 r["backend"] = "remote"
                 return r, time.monotonic() - t0
             except asr.Unsupported as e:
@@ -527,12 +622,12 @@ class Session:
                 pause = min(pause * 2, 2.0)
 
     @staticmethod
-    def call_backend(audio, lang, task, mt, timeout):
+    def call_backend(audio, lang, task, mt, timeout, due=None):
         if isinstance(mt, list):   # API v4: every track in one request
-            m = backend.multi(audio, lang, mt, timeout=timeout)
+            m = backend.multi(audio, lang, mt, timeout=timeout, due=due)
             return {"tracks": m["tracks"], "speech_ratio": m.get("speech_ratio"),
                     "language": m.get("language"), "errors": m.get("errors", {})}
-        return backend.transcribe(audio, lang, task, mt, timeout=timeout)
+        return backend.transcribe(audio, lang, task, mt, timeout=timeout, due=due)
 
     def watch_source_cc(self, data):
         """Notice CEA-608/708 captions already in the source (first 500 frames)."""
@@ -570,13 +665,17 @@ class Session:
                 a, b, text, _ = self.pending
                 self.pending = None
                 self.emit(a, b, text)
-            if ARCHIVE_DIR:
+            if ARCHIVE_DIR and cfg.settings.get("archive"):
                 self.archive(audio, rec)
 
     def _caption(self, audio, start, rec):
         reason = rec["gate"] = asr.gate(audio)
         if reason:
             return self.drop(reason)
+        # Where the speech in this chunk is: Seamless text is placed on it,
+        # and no subtitle stays up long past its end (add_vtt).
+        regions = [(start + int(s * TICKS), start + int(e * TICKS)) for s, e in asr.speech_regions(audio)]
+        self.speech_end = regions[-1][1] if regions else start + len(audio) * TICKS // SR
         lang = self.ch.language if self.ch.language != "auto" else self.language
         if lang and lang not in asr.WHISPER_LANGS:
             self.stats["language"] = f"{lang} (not supported by Whisper)"
@@ -623,6 +722,8 @@ class Session:
             return self.drop("asr_error")
         self.stats["asr_rtf"] = round(el / (len(audio) / SR), 3)
         self.stats["asr_last_s"] = round(el, 2)
+        self.stats["asr_seconds_sum"] = round(self.stats.get("asr_seconds_sum", 0) + el, 3)
+        self.stats["asr_seconds_count"] = self.stats.get("asr_seconds_count", 0) + 1
         self.stats["asr_used"] = rec["backend"] = r.get("backend", type(backend).__name__)
         ratio = rec["speech_ratio"] = r.get("speech_ratio")
         if self.ch.language == "auto":
@@ -659,7 +760,6 @@ class Session:
                 kept.append((a, b, text))
         if r.get("mt") == "seamless" and kept:
             # One segment for the whole chunk: put the text on the speech.
-            regions = [(start + int(s * TICKS), start + int(e * TICKS)) for s, e in asr.speech_regions(audio)]
             kept = [(a, b, t) for a, b, text in kept for a, b, t in self.place(a, b, text, regions)]
         for a, b, text in self.sentence_flow(kept):
             self.emit(a, b, text)
@@ -677,16 +777,12 @@ class Session:
             t0 = time.monotonic()
             self.compare(audio, start, lang, task, r.get("mt") or mt, r)
             self.stats["compare_total_s"] = round(el + time.monotonic() - t0, 2)
-        detecting = self.ch.language == "auto" and self.language is None
         if not kept and MUSIC_CAPTION and (ratio is None or ratio < 0.5) and asr.loud(audio):
             # Not bars or silence (gated above) and no usable words: music.
             # (Music doesn't count toward language detection: detect() needs speech.)
-            self.emit(start, start + len(audio) * TICKS // SR,
-                      MUSIC_CAPTION + (" - detecting language..." if detecting else ""), log_it=False)
+            self.emit(start, start + len(audio) * TICKS // SR, MUSIC_CAPTION, log_it=False)
             self.drop("music_caption")
             rec["music_caption"] = True
-        elif not kept and detecting:
-            self.emit(start, start + len(audio) * TICKS // SR, "detecting language...", log_it=False)
 
     def archive(self, audio, rec):
         """Keep the chunk's audio and ASR record for ARCHIVE_MINUTES (debugging)."""
@@ -706,10 +802,12 @@ class Session:
         except OSError as e:
             log.warning("%s: archive failed: %s", self.ch.id, e)
 
-    def add_vtt(self, track, a, b, text, ascii_only=True):
+    def add_vtt(self, track, a, b, text, ascii_only=True, speech_end=None):
         """Lay out text for a WebVTT track and append it, keeping cue starts
         strictly increasing (the DVR's remuxer rejects backwards timestamps)
-        and cues non-overlapping (Fire TV stacks overlapping cues)."""
+        and cues non-overlapping (Fire TV stacks overlapping cues). A cue
+        never stays up more than a second past the chunk's speech_end (ticks),
+        so subtitles clear during silence."""
         cues = self.ch.vtt_tracks.setdefault(track, collections.deque(maxlen=300))
         # The WebVTT tracks have no 32-column limit: their own line length.
         vtt_chars = int(self.ch.cfg.get("vtt_chars", VTT_CHARS))
@@ -718,6 +816,8 @@ class Session:
                                    self.ch.cfg.get("cc_layout") or "balanced", ascii_only,
                                    self.ch.cfg.get("sentences", True))
         for ca, cb, g in cc608.timed_groups(a, b, groups):
+            if speech_end is not None:
+                cb = min(cb, max(ca + int(cc608.MIN_SHOW * TICKS), speech_end + TICKS))
             if cues:
                 ps, pe, pt = cues[-1]
                 ca = max(ca, ps + 1800)          # at least one frame later
@@ -813,7 +913,7 @@ class Session:
                         or guard.keep(s, r.get("speech_ratio"))) is None:
                     for a, b, t in self.place(start + int(s["start"] * TICKS), start + int(s["end"] * TICKS),
                                               s["text"], regions):
-                        self.add_vtt("seamless", a, b, t)
+                        self.add_vtt("seamless", a, b, t, speech_end=regions[-1][1] if regions else None)
 
     def compare(self, audio, start, lang, task, primary, r):
         """Extra subtitle tracks for comparing models (channel option
@@ -888,7 +988,7 @@ class Session:
             self.encoder.split_segment(a, b, text, self.ch.cfg.get("cc_position") or "bottom",
                                        self.ch.cfg.get("cc_center") or CC_CENTER,
                                        self.ch.cfg.get("cc_layout") or "balanced")
-        self.add_vtt("main", a, b, text)
+        self.add_vtt("main", a, b, text, speech_end=self.speech_end)
         if log_it:
             self.stats["captions"] += 1
             self.ch.recent.append({"pts": round(a / TICKS, 1), "text": text.strip(),
@@ -964,14 +1064,14 @@ class Session:
                 # With a margin: right after a cold start the lead grows as the
                 # backlog is read, and wobbles around MIN_LEAD on the way up;
                 # re-anchoring there paused the output for nothing.
-                established = established or lead >= MIN_LEAD + 5
+                established = established or lead >= self.min_lead + 5
                 # Startup runs on the HLS backlog; once it should have built
                 # up, keep at least MIN_LEAD so ASR has time to finish.
-                if ((established or ts - anchor[1] > 30 * TICKS) and lead < MIN_LEAD
-                        or lead > DELAY + 60):
+                if ((established or ts - anchor[1] > 30 * TICKS) and lead < self.min_lead
+                        or lead > self.delay + 60):
                     log.info("%s: re-anchoring output clock (lead %.1fs)", self.ch.id, lead)
-                    anchor = self.anchor = (arrival + DELAY, ts)
-                    due = arrival + DELAY
+                    anchor = self.anchor = (arrival + self.delay, ts)
+                    due = arrival + self.delay
                 self.stats["lead_s"] = round(lead, 1)
                 wait = due - time.monotonic()
                 if wait > 0:
@@ -1066,14 +1166,14 @@ def pick_variant(url, headers):
     return best[1] if best else url
 
 
-def find_cut(audio):
+def find_cut(audio, chunk_min=CHUNK_MIN, chunk_max=CHUNK_MAX):
     """Sample index to cut at: the middle of the first pause of PAUSE_MS
-    after CHUNK_MIN, or the quietest point once the buffer reaches CHUNK_MAX."""
+    after chunk_min, or the quietest point once the buffer reaches chunk_max."""
     win = SR // 50
     n = len(audio) // win
     energy = np.sqrt(np.mean(audio[:n * win].reshape(n, win) ** 2, axis=1))
     smooth = np.convolve(energy, np.ones(3) / 3, mode="same")
-    lo = int(CHUNK_MIN * 50) - 1
+    lo = int(chunk_min * 50) - 1
     if n <= lo:
         return None
     quiet = smooth < max(10 ** (-50 / 20), 0.25 * float(np.median(smooth[:n])))
@@ -1083,7 +1183,7 @@ def find_cut(audio):
         run = run + 1 if quiet[i] else 0
         if run >= need and i - need // 2 >= lo:
             return (i - need // 2) * win
-    if len(audio) < CHUNK_MAX * SR:
+    if len(audio) < chunk_max * SR:
         return None
     smooth = np.convolve(energy, np.ones(10) / 10, mode="same")
     i = int(np.argmin(smooth[lo:n]))
@@ -1175,14 +1275,21 @@ class Channel:
 
     def status(self):
         s = self.session
-        return {"name": self.name, "number": self.number, "url": f"{PUBLIC_URL}/{self.id}.ts",
+        return {"name": self.name, "number": self.number, "url": f"{PUBLIC_URL}/hls/{self.id}/master.m3u8",
                 "language": self.language, "clients": len(self.broadcaster.clients),
                 "session": None if s is None else s.stats,
                 "burned_compare": None if self.burner is None else self.burner.stats,
+                "segmenter_resumes": getattr(self, "segmenter_resumes", 0),
                 "recent": list(self.recent)[-10:]}
 
 
 cfg = None       # config.Config, loaded in main()
+nllb_download = nllbget.Download()   # the guide translator's model
+
+
+def nllb_missing():
+    """EPG_TRANSLATE=1 and no model: download it once, in the background."""
+    nllb_download.start(guide.wake.set)   # (no-op while one runs)
 guide = epg.Guide()
 checker = None   # health.Checker, started in main()
 channels = {}    # id -> Channel, created on first use
@@ -1203,6 +1310,100 @@ def channel(cid, enabled_only=True):
             channels[cid] = Channel(c)
         channels[cid].cfg = c
         return channels[cid]
+class ChannelWorker:
+    """A channel's pipeline (Session, Segmenter, Burner) in its own process,
+    `relay.py --worker <id>`: one Python process for every channel ran out of
+    CPU at about 8 streams. The front process (HTTP, settings, the ASR queue)
+    starts it on the first request, proxies the channel's requests to it, and
+    it exits once idle. Its ASR requests come back through the front (/asr/),
+    which queues them across channels."""
+
+    def __init__(self, cid):
+        self.cid, self.proc, self.port = cid, None, None
+        self.lock = threading.Lock()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def ensure(self):
+        with self.lock:
+            if not self.alive():
+                env = dict(os.environ)
+                if isinstance(backend, asr.Remote):
+                    env["ASR_URL"] = f"http://127.0.0.1:{PORT}/asr"
+                self.proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", self.cid],
+                                             stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+                line = self.proc.stdout.readline().split()   # "port <n>" once it listens
+                if len(line) != 2:
+                    self.proc.kill()
+                    raise RuntimeError("channel worker failed to start")
+                self.port = int(line[1])
+                log.info("%s: worker %d on port %d", self.cid[:40], self.proc.pid, self.port)
+            return self.port
+
+    def request(self, method, path, timeout=30, start=True):
+        """(connection, response) from the worker; starts it if needed."""
+        for attempt in (0, 1):
+            if not start and not self.alive():
+                raise ConnectionRefusedError("not running")
+            conn = http.client.HTTPConnection("127.0.0.1", self.ensure(), timeout=timeout)
+            try:
+                conn.request(method, path)
+                return conn, conn.getresponse()
+            except ConnectionRefusedError:
+                conn.close()
+                if attempt or not start:
+                    raise
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.proc.wait(5)   # it was exiting (idle): start a new one
+                if self.alive():
+                    self.proc.kill()
+                    self.proc.wait()
+
+    def status(self):
+        try:
+            conn, r = self.request("GET", "/status", timeout=2, start=False)
+            try:
+                return json.loads(r.read())
+            finally:
+                conn.close()
+        except (OSError, ValueError, http.client.HTTPException):
+            return None
+
+
+workers = {}           # id -> ChannelWorker (front process)
+workers_lock = threading.Lock()
+
+
+def worker(cid):
+    with workers_lock:
+        if cid not in workers:
+            workers[cid] = ChannelWorker(cid)
+        return workers[cid]
+
+
+def channel_status(cid):
+    """A channel's status: from its worker, or idle."""
+    w = workers.get(cid)
+    st = w.status() if w and w.alive() else None
+    if st is None:
+        ch = channel(cid)
+        st = {"name": ch.name, "number": ch.number, "url": f"{PUBLIC_URL}/hls/{cid}/master.m3u8", "language": ch.language,
+              "clients": 0, "session": None, "burned_compare": None, "recent": []}
+    return st
+
+
+def read_version():
+    """The build's version: the VERSION file a package or image puts next to
+    relay.py (e.g. "0.1.0+r3.g6b33b4a"), else "dev"."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")) as f:
+            return f.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+VERSION = read_version()
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"), "rb") as f:
     UI = f.read()
 _health = {"at": 0.0, "value": None}
@@ -1222,12 +1423,115 @@ def burn_tracks(c, lang=None):
     return [("main" if t == mt else t, *style[t]) for t in chosen]
 
 
+def metrics():
+    """Prometheus text format, for Netdata (go.d prometheus) and the like.
+    Per-channel series are labelled by channel number only (ad-hoc streams:
+    "adhoc"), so the label set stays small."""
+    rows = []
+
+    def add(name, value, labels=None, kind="gauge"):
+        if value is None:
+            return
+        if not any(r[0] == name for r in rows):
+            rows.append((name, None, f"# TYPE {name} {kind}"))
+        lab = ",".join(f'{k}="{v}"' for k, v in (labels or {}).items())
+        rows.append((name, lab, f"{name}{{{lab}}} {value}" if lab else f"{name} {value}"))
+
+    live = {cid: w for cid, w in list(workers.items()) if w.alive()}
+    add("relay_workers", len(live))
+    add("relay_asr_in_flight", GPU_LOCK.active)
+    add("relay_asr_waiting", len(GPU_LOCK.waiting))
+    add("relay_asr_parallel", GPU_LOCK.limit())
+    adhoc_sum = collections.Counter()
+    for cid, w in live.items():
+        st = w.status() or {}
+        s = st.get("session") or {}
+        cpu, rss = proc_usage(w.proc.pid)
+        if cid.startswith("x-"):
+            adhoc_sum["streams"] += 1
+            adhoc_sum["captions"] += s.get("captions", 0)
+            adhoc_sum["skipped"] += sum((s.get("dropped") or {}).get(r, 0) for r in ("asr_down", "asr_busy"))
+            adhoc_sum["cpu"] += cpu or 0
+            adhoc_sum["rss"] += rss or 0
+            continue
+        lab = {"channel": st.get("number") or cid[:24]}
+        add("relay_channel_clients", st.get("clients"), lab)
+        add("relay_channel_lead_seconds", s.get("lead_s"), lab)
+        add("relay_channel_asr_last_seconds", s.get("asr_last_s"), lab)
+        add("relay_channel_asr_seconds_sum", s.get("asr_seconds_sum"), lab, "counter")
+        add("relay_channel_asr_seconds_count", s.get("asr_seconds_count"), lab, "counter")
+        add("relay_channel_captions_total", s.get("captions"), lab, "counter")
+        for reason, n in (s.get("dropped") or {}).items():
+            add("relay_channel_chunks_dropped_total", n, dict(lab, reason=reason), "counter")
+        add("relay_channel_segmenter_resumes_total", st.get("segmenter_resumes"), lab, "counter")
+        add("relay_channel_worker_cpu_seconds_total", cpu, lab, "counter")
+        add("relay_channel_worker_rss_bytes", rss, lab)
+    add("relay_adhoc_streams", adhoc_sum["streams"])
+    add("relay_adhoc_captions_total", adhoc_sum["captions"], kind="counter")
+    add("relay_adhoc_chunks_skipped_total", adhoc_sum["skipped"], kind="counter")
+    add("relay_adhoc_worker_cpu_seconds_total", round(adhoc_sum["cpu"], 2), kind="counter")
+    add("relay_adhoc_worker_rss_bytes", adhoc_sum["rss"])
+    cpu, rss = proc_usage(os.getpid())
+    add("relay_front_cpu_seconds_total", cpu, kind="counter")
+    add("relay_front_rss_bytes", rss)
+    # group each metric's lines under its TYPE line
+    order = list(dict.fromkeys(r[0] for r in rows))
+    return "\n".join(r[2] for name in order for r in rows if r[0] == name) + "\n"
+
+
+def proc_usage(pid):
+    """(CPU seconds, resident bytes) of a process, from /proc (Linux)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (round((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), 2),
+                int(fields[21]) * os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def url_problem(name, value, need_port=False):
+    """Why a configured URL is unusable, or None: http(s), a host (and a port)."""
+    u = urllib.parse.urlsplit(value or "")
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return (f"{name}={value!r} is not a URL like http://host:port "
+                f"(check the slashes after 'http:')")
+    if need_port and not u.port:
+        return f"{name}={value!r} has no port (the ASR server listens on 8096: http://host:8096)"
+    return None
+
+
+def config_problems():
+    """Misconfigured ASR_URL / PUBLIC_URL, for the log and the web page."""
+    out = []
+    if isinstance(backend, asr.Remote):
+        out.append(url_problem("ASR_URL", backend.url, need_port=True))
+    out.append(url_problem("PUBLIC_URL", PUBLIC_URL))
+    return [p for p in out if p]
+
+
+def watch_asr():
+    """Log when the speech server becomes unreachable or answers again (once
+    per change, not per chunk)."""
+    up = None
+    while True:
+        h = asr_health()
+        if h is not None and h.get("ok", True) != up:
+            up = h.get("ok", True)
+            if up:
+                log.info("speech server %s: up (%s)", h.get("url"), h.get("backend"))
+            else:
+                log.warning("speech server unreachable at %s (%s): no captions until it answers",
+                            h.get("url"), h.get("error"))
+        time.sleep(float(os.environ.get("ASR_WATCH", "30")))
+
+
 def asr_health():
     """The remote ASR service's /health, cached for a few seconds."""
     remote = getattr(backend, "primary", backend)
     if not isinstance(remote, asr.Remote):
         return None
-    if time.monotonic() - _health["at"] > 5:
+    if time.monotonic() - _health["at"] > min(5.0, float(os.environ.get("ASR_WATCH", "30"))):
         v = {"url": remote.url}
         try:
             with urllib.request.urlopen(remote.url + "/health", timeout=1.5) as r:
@@ -1242,23 +1546,22 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def log_message(self, fmt, *args):
-        log.info("http %s %s", self.client_address[0], fmt % args)
+        if not WORKER and not self.path.startswith("/asr/"):   # (the front logs each request once)
+            log.info("http %s %s", self.client_address[0], fmt % args)
 
     def do_GET(self):
         path = self.path.split("?")[0].strip("/")
+        if WORKER:
+            return self.worker_get(path)
+        if path == "asr/health":
+            return self.asr_proxy(None)
         if path.startswith("hls/"):
             return self.hls(path)
         if path in ("api/stream", "api/m3u"):
             return self.adhoc(path)
-        if path == "stream.ts":  # pre-multi-channel URL
-            enabled = cfg.enabled()
-            path = (enabled[0]["id"] if enabled else "none") + ".ts"
-        if path.endswith(".ts"):
-            ch = channel(path[:-3])
-            return self.stream(ch) if ch else self.reply(404, "text/plain", b"no such channel\n")
-        if path == "playlist-hls.m3u":
-            # Same channels and numbers as playlist.m3u, served as HLS with a
-            # WebVTT English subtitle track (Channels DVR shows these centred).
+        if path in ("playlist.m3u", "playlist.m3u8", "playlist-hls.m3u"):
+            # The enabled channels as HLS with a WebVTT English subtitle track
+            # (Channels DVR: Stream Format HLS). playlist-hls.m3u: its old name.
             body = f'#EXTM3U url-tvg="{PUBLIC_URL}/epg.xml" x-tvg-url="{PUBLIC_URL}/epg.xml"\n'
             for c in cfg.enabled():
                 tvg = c.get("tvg", {})
@@ -1281,20 +1584,9 @@ class Handler(BaseHTTPRequestHandler):
             with guide.lock:
                 body = guide.xml
             return self.reply(200, "application/xml; charset=utf-8", body)
-        if path in ("playlist.m3u", "playlist.m3u8"):
-            body = f'#EXTM3U url-tvg="{PUBLIC_URL}/epg.xml" x-tvg-url="{PUBLIC_URL}/epg.xml"\n'
-            for c in cfg.enabled():
-                tvg = c.get("tvg", {})
-                logo = f' tvg-logo="{tvg["tvg-logo"]}"' if tvg.get("tvg-logo") else ""
-                group = tvg.get("group-title") or "captions-dvr"
-                body += (f'#EXTINF:-1 channel-id="{c["id"]}" tvg-id="{tvg.get("tvg-id") or c["id"]}" '
-                         f'tvg-chno="{c.get("number") or ""}" tvg-name="{c["name"]}"{logo} '
-                         f'group-title="{group}",{c["name"]}\n'
-                         f"{PUBLIC_URL}/{c['id']}.ts\n")
-            return self.reply(200, "audio/x-mpegurl", body.encode())
         if path == "api/config":
             with config.lock:
-                body = json.dumps({"sources": cfg.sources, "channels": cfg.channels, "settings": cfg.settings,
+                body = json.dumps({"version": VERSION, "sources": cfg.sources, "channels": cfg.channels, "settings": cfg.settings,
                                    "languages": languages.data,
                                    "health": {"running": checker.running, "progress": checker.progress},
                                    "epg": guide.matches, "epg_updated": guide.updated,
@@ -1302,14 +1594,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, "application/json", body)
         if path in ("", "index.html"):
             return self.reply(200, "text/html; charset=utf-8", UI)
+        if path == "metrics":
+            return self.reply(200, "text/plain; version=0.0.4", metrics().encode())
         if path == "status":
-            body = json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            body = json.dumps({"version": VERSION, "config_problems": config_problems(),
+                               "time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+                               "epg_model": nllb_download.state if epg.TRANSLATE() else {"state": "off"},
                                "asr_backend": type(backend).__name__,
                                "asr_health": asr_health(),
                                "asr_last_error": getattr(backend, "last_error", None),
-                               "channels": {c["id"]: channel(c["id"]).status() for c in cfg.enabled()},
-                               "adhoc": {cid: c.status() for cid, c in list(channels.items())
-                                         if c.cfg.get("adhoc") and c.session}},
+                               "channels": {c["id"]: channel_status(c["id"]) for c in cfg.enabled()},
+                               "adhoc": {cid: w.status() for cid, w in list(workers.items())
+                                         if cid.startswith("x-") and w.alive()}},
                               indent=1).encode()
             return self.reply(200, "application/json", body)
         return self.reply(404, "text/plain", b"not found\n")
@@ -1317,15 +1613,7 @@ class Handler(BaseHTTPRequestHandler):
     def adhoc(self, path):
         """Stateless mode: /api/m3u rewrites a playlist to /api/stream URLs;
         /api/stream serves one source as HLS (the master playlist)."""
-        raw = self.path.partition("?")[2]
-        q = urllib.parse.parse_qs(raw)
-        # Lenient about the source URL: "?urlhttps%3A..." (the "=" lost in
-        # copy and paste), and an unencoded url=...?a=1&b=2 (everything up to
-        # the next relay parameter).
-        m = re.search(r"(?:^|&)url=?(https?(?::|%3A).*?)(?=&(?:mt|lang|pos|compare|chno_offset|referer|user_agent)=|$)",
-                      raw, re.I)
-        if m:
-            q["url"] = [urllib.parse.unquote(m.group(1))]
+        q = adhoc.parse_query(self.path.partition("?")[2])
         try:
             if path == "api/m3u":
                 body = adhoc.rewrite_m3u(adhoc.fetch_m3u((q.get("url") or [""])[0]), PUBLIC_URL, q)
@@ -1333,9 +1621,8 @@ class Handler(BaseHTTPRequestHandler):
             o, mt = adhoc.options(q)
             cid = adhoc.token(o)
             ch = channel(cid)
-            track = adhoc.want(ch.cfg, mt or hls.main_mt({}))
-            if ch.session is None:
-                active = sum(1 for c in list(channels.values()) if c.cfg.get("adhoc") and c.session)
+            if not worker(cid).alive():
+                active = sum(1 for k, w in list(workers.items()) if k.startswith("x-") and w.alive())
                 if active >= adhoc.MAX_SESSIONS:
                     raise adhoc.Refused(f"{active} streams already running (MAX_ADHOC_SESSIONS)", 503)
                 adhoc.probe(ch.url, ch.cfg.get("headers") or {})
@@ -1343,13 +1630,16 @@ class Handler(BaseHTTPRequestHandler):
         except adhoc.Refused as e:
             log.info("ad-hoc refused (%d): %s", e.code, e)
             return self.reply(e.code, "text/plain", f"{e}\n".encode())
-        return self.hls(f"hls/{cid}/master.m3u8" if track == "main" else f"hls/{cid}/master-{track}.m3u8")
+        # The worker maps the backend to its subtitle track (Handler.hls).
+        return self.proxy(cid, f"/hls/{cid}/master-{mt}.m3u8" if mt else f"/hls/{cid}/master.m3u8")
 
     def hls(self, path):
         _, cid, name = (path.split("/") + ["", ""])[:3]
         ch = channel(cid)
         if ch is None:
             return self.reply(404, "text/plain", b"no such channel\n")
+        if not WORKER:
+            return self.proxy(cid, "/" + path)
         if ch.cfg.get("adhoc"):
             # A backend variant's URL (e.g. after a relay restart): register
             # the backend and map it to the track that carries it.
@@ -1390,6 +1680,68 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, "text/vtt", v.encode()) if v else self.reply(404, "text/plain", b"gone\n")
         return self.reply(404, "text/plain", b"not found\n")
 
+    def worker_get(self, path):
+        """A channel worker process: its channel's HLS, TS stream and status."""
+        if path.startswith("hls/"):
+            return self.hls(path)
+        if path == "status":
+            return self.json(200, channel(WORKER).status())
+        return self.reply(404, "text/plain", b"not found\n")
+
+    def proxy(self, cid, path):
+        """Front process: the request, answered by the channel's worker."""
+        try:
+            conn, r = worker(cid).request("GET", path, timeout=90)
+        except (OSError, RuntimeError, http.client.HTTPException) as e:
+            return self.reply(502, "text/plain", f"channel worker: {e}\n".encode())
+        try:
+            self.send_response(r.status)
+            for k, v in r.getheaders():
+                if k.lower() in ("content-type", "content-length", "cache-control"):
+                    self.send_header(k, v)
+            self.end_headers()
+            while True:
+                b = r.read1(1 << 16)
+                if not b:
+                    break
+                self.wfile.write(b)
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            conn.close()
+
+    def asr_proxy(self, body):
+        """Front process: a worker's ASR request, queued across channels
+        (ASRGate, earliest X-Due first) and passed on to the ASR server."""
+        if not isinstance(backend, asr.Remote):
+            return self.json(404, {"error": "no remote ASR"})
+        if body is None:   # GET /asr/health
+            h = asr_health()
+            return self.json(200 if h.get("ok") else 502, h)
+        due = float(self.headers.get("X-Due") or 0) or time.monotonic() + DELAY / 2
+        if not GPU_LOCK.acquire(due, timeout=max(0.1, due - time.monotonic() - 2)):
+            return self.json(503, {"error": "busy"})
+        try:
+            # Only the time left after the wait: the worker gives up at its
+            # deadline, and a decode nobody waits for delays the others.
+            left = due - time.monotonic() - 1
+            if left < 0.5:
+                return self.json(503, {"error": "busy"})
+            req = urllib.request.Request(backend.url + self.path[len("/asr"):], data=body,
+                                         headers={"Content-Type": "audio/wav"}, method="POST")
+            # (a long chunk, ~28 s, may take longer than ASR_TIMEOUT under load)
+            with urllib.request.urlopen(req, timeout=min(left, max(backend.timeout, len(body) / 32000))) as r:
+                code, out = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            code, out = e.code, e.read()
+        except Exception as e:  # noqa: BLE001 - the worker retries while there is time
+            code, out = 502, json.dumps({"error": f"{type(e).__name__}: {e}"}).encode()
+            backend.last_error = f"{type(e).__name__}: {e}"
+        finally:
+            GPU_LOCK.release()
+        with contextlib.suppress(OSError):   # the worker may have given up meanwhile
+            self.reply(code, "application/json", out)
+
     def do_HEAD(self):
         """Headers only, for players and DVRs that probe URLs before GET."""
         path = self.path.split("?")[0].strip("/")
@@ -1414,6 +1766,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Config API used by the web page. LAN only; no authentication."""
         path = self.path.split("?")[0].strip("/")
+        if path.startswith("asr/") and not WORKER:
+            return self.asr_proxy(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         try:
             data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             if path == "api/sources":
@@ -1453,45 +1807,92 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def stream(self, ch):
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp2t")
-        self.end_headers()
-        cq = ch.subscribe()
-        try:
-            while True:
-                chunk = cq.get(timeout=60)
-                if chunk is None:
-                    break
-                self.wfile.write(chunk)
-        except (OSError, queue.Empty):
-            pass
-        finally:
-            ch.unsubscribe(cq)
+
+
+def prune_archive():
+    """Remove archived chunks older than ARCHIVE_MINUTES (also once the
+    archive is switched off, so it doesn't stay on disk)."""
+    cutoff = time.time() - ARCHIVE_MINUTES * 60
+    for root, _, files in os.walk(ARCHIVE_DIR):
+        for name in files:
+            path = os.path.join(root, name)
+            with contextlib.suppress(OSError):
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
 
 
 def housekeeping():
+    n = 0
     while True:
         time.sleep(5)
-        for ch in list(channels.values()):
-            ch.tick()
+        for w in list(workers.values()):
+            w.alive()   # reaps a worker that exited
+        n += 1
+        if ARCHIVE_DIR and n % 60 == 1:
+            prune_archive()
 
 
-def main():
-    global cfg
-    if not os.path.exists(CHANNELS_FILE) and os.path.exists(SEED_FILE):
-        shutil.copy(SEED_FILE, CHANNELS_FILE)  # first run: start from the bundled channels
-    cfg = config.Config(CHANNELS_FILE)
-    cfg.save()  # writes the current format
-    threading.Thread(target=housekeeping, name="housekeeping", daemon=True).start()
+def setup():
     hls.BACKEND = backend
     hls.COUNTRIES = lambda c: config.channel_countries(c, cfg.sources)
     hls.COUNTRY_LANG = epg.guide_language
     hls.SETTINGS = cfg.settings
     slate.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(CHANNELS_FILE)), "slate")
-    threading.Thread(target=slate.prepare, name="slate", daemon=True).start()
     if isinstance(backend, asr.Remote):
         backend.api()   # learn the server's tracks (e.g. seamless) before serving playlists
+
+
+def worker_main(cid):
+    """A channel's worker process (ChannelWorker): serves the channel on a
+    loopback port, which it prints for the front process."""
+    global cfg, WORKER
+    WORKER = cid
+    cfg = config.Config(CHANNELS_FILE)
+    setup()
+    ch = channel(cid)
+    if ch is None:
+        sys.exit(f"no such channel {cid}")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=worker_housekeeping, args=(ch, srv), name="housekeeping", daemon=True).start()
+    print(f"port {srv.server_port}", flush=True)
+    srv.serve_forever()
+
+
+def worker_housekeeping(ch, srv):
+    """Worker: the channel's tick, channel and settings changes made in the
+    web page (the front saves them to CHANNELS_FILE), and exit once idle or
+    when the front process is gone."""
+    parent, mtime, idle = os.getppid(), os.path.getmtime(CHANNELS_FILE), 0
+    while True:
+        time.sleep(2)
+        ch.tick()
+        with contextlib.suppress(OSError, ValueError):
+            if os.path.getmtime(CHANNELS_FILE) != mtime:
+                mtime = os.path.getmtime(CHANNELS_FILE)
+                cfg.load()
+                if not ch.cfg.get("adhoc") and cfg.get(ch.id):
+                    ch.cfg = cfg.get(ch.id)
+        idle = idle + 2 if ch.session is None and ch.hls is None else 0
+        if idle >= 10 or os.getppid() != parent:
+            log.info("%s: worker exiting (%s)", ch.id[:40], "idle" if idle >= 10 else "front gone")
+            srv.socket.close()   # new requests go to a new worker
+            time.sleep(1)
+            os._exit(0)
+
+
+def main():
+    global cfg
+    cfg = config.Config(CHANNELS_FILE)
+    cfg.save()  # writes the current format
+    threading.Thread(target=housekeeping, name="housekeeping", daemon=True).start()
+    setup()
+    threading.Thread(target=slate.prepare, name="slate", daemon=True).start()
+    epg.MODEL_MISSING = nllb_missing
+    for problem in config_problems():
+        log.error("configuration: %s", problem)
+    if isinstance(backend, asr.Remote):
+        threading.Thread(target=watch_asr, name="asr-watch", daemon=True).start()
     global checker
     checker = health.Checker(cfg, pick_variant, config)
     threading.Thread(target=checker.loop, name="health", daemon=True).start()
@@ -1501,10 +1902,13 @@ def main():
         lambda: [(c, config.channel_countries(c, cfg.sources)) for c in cfg.enabled()],)).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    log.info("serving %d enabled channels on :%d, playlist %s/playlist.m3u",
+    log.info("serving %d enabled channels on :%d, playlist %s/playlist.m3u (HLS)",
              len(cfg.enabled()), PORT, PUBLIC_URL)
     srv.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--worker"]:
+        worker_main(sys.argv[2])
+    else:
+        main()

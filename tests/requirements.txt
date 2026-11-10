@@ -1,0 +1,2 @@
+-r ../relay/requirements.txt
+pytest

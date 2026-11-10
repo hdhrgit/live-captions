@@ -31,7 +31,7 @@ BACKENDS = {"sml": "seamless", "seamless": "seamless", "nllb": "nllb", "wsp": "w
 # Query parameters that /api/m3u passes on to each /api/stream URL.
 # Compare mode's backends and resolution are relay settings (web page), not
 # per URL.
-STREAM_PARAMS = ("mt", "lang", "pos", "compare")
+STREAM_PARAMS = ("mt", "lang", "pos", "compare", "chunk")
 
 
 class Refused(Exception):
@@ -62,6 +62,22 @@ def allowed(url):
     raise Refused(f"source host {host} is not in SOURCE_ALLOW")
 
 
+# The relay's own query parameters, which end an unencoded source URL.
+PARAMS = ("mt", "lang", "pos", "compare", "chunk", "name", "chno", "chno_step", "chno_offset", "referer",
+          "user_agent")
+
+
+def parse_query(raw):
+    """/api/stream and /api/m3u query string -> dict of lists, lenient about
+    the source URL: "?urlhttps%3A..." (the "=" lost in copy and paste), and an
+    unencoded url=...?a=1&b=2 (everything up to the next relay parameter)."""
+    q = urllib.parse.parse_qs(raw)
+    m = re.search(r"(?:^|&)url=?(https?(?::|%3A).*?)(?=&(?:" + "|".join(PARAMS) + r")=|$)", raw, re.I)
+    if m:
+        q["url"] = [urllib.parse.unquote(m.group(1))]
+    return q
+
+
 def options(q):
     """Channel options from /api/stream query parameters (dict of lists)."""
     get = lambda k, d=None: (q.get(k) or [d])[0]  # noqa: E731
@@ -81,6 +97,8 @@ def options(q):
         o["p"] = get("pos")
     if get("compare") in ("1", "true", "yes"):
         o["c"] = 1
+    if get("chunk") == "long":   # 20-28 s chunks, video ~50 s behind (relay.LONG_CHUNKS)
+        o["k"] = 1
     if get("name"):
         o["n"] = get("name")[:80]
     for k, name in (("referer", "r"), ("user_agent", "a")):
@@ -125,6 +143,8 @@ def channel_cfg(cid):
     c = {"id": cid, "name": o.get("n", ""), "url": o["u"], "enabled": True, "adhoc": True,
          "language": o.get("l", "auto"), "cc_position": o.get("p", "bottom"), "burn": False,
          "headers": {k: o[n] for k, n in (("referer", "r"), ("user_agent", "a")) if o.get(n)}}
+    if o.get("k"):
+        c["long_chunks"] = True
     if o.get("c"):   # burned-in compare video (backends and resolution: relay settings)
         c["compare"] = c["burn"] = True
     return c

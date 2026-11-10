@@ -15,6 +15,9 @@ services:
       ASR_URL: ${ASR_URL:-http://asr-host:8096}   # set in .env: the Mac running asr_server.py
       ASR_TIMEOUT: "10"
       AC4_FFMPEG: ${AC4_FFMPEG:-}
+      EPG_TRANSLATE: ${EPG_TRANSLATE:-0}   # 1: English programme guide (NLLB; downloads the model if missing)
+      CUE_BLANK: ${CUE_BLANK:-}   # text of an optional blank cue after each caption (off when empty)
+      MAX_ADHOC_SESSIONS: ${MAX_ADHOC_SESSIONS:-6}   # stateless /api/stream streams at once
       # Last hour of ASR chunks (WAV + JSON with raw output and drop reasons)
       ARCHIVE_DIR: /archive
       ARCHIVE_MINUTES: "60"

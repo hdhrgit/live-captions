@@ -276,6 +276,13 @@ class Config:
                 if int(changes["burn_height"]) not in (360, 480, 540, 720, 1080):
                     raise ValueError("burn_height must be 360, 480, 540, 720 or 1080")
                 self.settings["burn_height"] = int(changes["burn_height"])
+            if "asr_parallel" in changes:
+                n = int(changes["asr_parallel"])
+                if not 1 <= n <= 32:
+                    raise ValueError("asr_parallel must be 1 to 32")
+                self.settings["asr_parallel"] = n
+            if "archive" in changes:
+                self.settings["archive"] = bool(changes["archive"])
             if "audio_ffmpeg" in changes:
                 path = str(changes["audio_ffmpeg"] or "").strip()
                 if path and not os.access(path, os.X_OK):
@@ -307,6 +314,8 @@ class Config:
                 c["compare_channels"] = bool(changes["compare_channels"])
             if "compare" in changes:
                 c["compare"] = bool(changes["compare"])
+            if "long_chunks" in changes:
+                c["long_chunks"] = bool(changes["long_chunks"])
             if "compare_mts" in changes:
                 mts = [m for m in ("seamless", "nllb", "whisper") if m in (changes["compare_mts"] or ())]
                 if not mts:
@@ -329,8 +338,10 @@ class Config:
                     raise ValueError("cc_layout must be balanced, fill or single")
                 c["cc_layout"] = changes["cc_layout"]
             if "cc_center" in changes:
-                if changes["cc_center"] not in ("nbtsp", "pad", "visible", "underscore", "underscore_all", "native", "608only"):
-                    raise ValueError("cc_center must be nbtsp, pad, visible, underscore, underscore_all, native or 608only")
+                if changes["cc_center"] not in ("nbtsp", "pad", "visible", "underscore", "underscore_all", "native",
+                                                "608only", "608space", "608tsp"):
+                    raise ValueError("cc_center must be nbtsp, pad, visible, underscore, underscore_all, native, "
+                                     "608only, 608space or 608tsp")
                 c["cc_center"] = changes["cc_center"]
             if "cc_position" in changes:
                 if changes["cc_position"] not in ("bottom", "middle", "top"):

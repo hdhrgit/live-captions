@@ -15,8 +15,8 @@ PY=${PYTHON:-python3}
 [ "$(uname -m)" = arm64 ] || { echo "needs Apple Silicon (arm64)"; exit 1; }
 mkdir -p "$PREFIX/app" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 [ -x "$PREFIX/venv/bin/python" ] || "$PY" -m venv "$PREFIX/venv"
-"$PREFIX/venv/bin/pip" install --quiet --upgrade pip
-"$PREFIX/venv/bin/pip" install --quiet -r "$SRC/mac/requirements.txt"
+"$PREFIX/venv/bin/pip" install --upgrade pip
+"$PREFIX/venv/bin/pip" install -r "$SRC/mac/requirements.txt"
 cp "$SRC/relay/asr.py" "$SRC/relay/asr_server.py" "$PREFIX/app/"
 
 # NLLB-200 1.3B for Korean/Arabic/Hebrew/... -> English text translation.
@@ -25,7 +25,7 @@ cp "$SRC/relay/asr.py" "$SRC/relay/asr_server.py" "$PREFIX/app/"
 NLLB_DIR="$PREFIX/nllb-200-distilled-1.3B-ct2"
 if [ ! -f "$NLLB_DIR/model.bin" ]; then
     echo "Downloading and converting NLLB-200 (one-off, ~5.5 GB download)..."
-    "$PREFIX/venv/bin/pip" install --quiet transformers torch
+    "$PREFIX/venv/bin/pip" install transformers torch
     # Fetch only the safetensors weights (not also pytorch_model.bin) into a
     # scratch dir, convert, then delete the download.
     TMP_NLLB="$PREFIX/nllb-download"
@@ -44,7 +44,7 @@ fi
 SEAMLESS_DIR="$PREFIX/seamless-m4t-v2-large"
 if [ "${SEAMLESS:-1}" = 1 ] && [ ! -f "$SEAMLESS_DIR/config.json" ]; then
     echo "Downloading SeamlessM4T v2 large (one-off, ~11 GB)..."
-    "$PREFIX/venv/bin/pip" install --quiet transformers torch protobuf sentencepiece
+    "$PREFIX/venv/bin/pip" install transformers torch protobuf sentencepiece
     "$PREFIX/venv/bin/python" -c "
 from huggingface_hub import snapshot_download
 snapshot_download('facebook/seamless-m4t-v2-large', local_dir='$SEAMLESS_DIR.tmp',

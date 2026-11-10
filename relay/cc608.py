@@ -12,6 +12,9 @@ ROWS = 15
 COLS = 32
 
 # CC1 control codes (first byte, second byte)
+# cc_center values that change how 608 lines are centred (the others are
+# 708 options; 608 uses PAC indent + tab offsets for them).
+CENTRE_608 = {"608space": "space", "608tsp": "tsp"}
 RCL = (0x14, 0x20)  # resume caption loading (pop-on)
 EDM = (0x14, 0x2C)  # erase displayed memory
 ENM = (0x14, 0x2E)  # erase non-displayed memory
@@ -171,8 +174,10 @@ def _layout(clean, width, rows, layout):
     return groups
 
 
-MIN_SHOW = 1.2      # seconds a cue stays up at least
+MIN_SHOW = 1.5      # seconds a cue stays up at least
 READ_CPS = 17.0     # reading speed: characters per second
+MAX_SHOW = 7.0      # seconds a cue stays up at most
+LINGER_CPS = 15.0   # ... and no longer than reading it slowly plus a second
 
 
 def timed_groups(start, end, groups):
@@ -185,7 +190,8 @@ def timed_groups(start, end, groups):
         chars = len(" ".join(g))
         dur = (end - start) * chars / total
         need = 90000 * max(MIN_SHOW, chars / READ_CPS)
-        out.append((int(t), int(t + max(dur, need)), g))
+        cap = 90000 * min(MAX_SHOW, max(MIN_SHOW, chars / LINGER_CPS + 1.0))
+        out.append((int(t), int(t + min(max(dur, need), cap)), g))
         t += dur
     return out
 
@@ -226,13 +232,27 @@ def _pac(row, col):
 POSITIONS = {"bottom": ROWS, "middle": 11, "top": 3}
 
 
-def cue_pairs(lines, position="bottom"):
-    """Byte pairs that load `lines` (<=2), centred, into non-displayed memory."""
+TSP = (0x11, 0x39)   # transparent space
+
+
+def cue_pairs(lines, position="bottom", centre="pac"):
+    """Byte pairs that load `lines` (<=2), centred, into non-displayed memory.
+    centre "pac": PAC indent + tab offsets; "space" / "tsp": the line starts
+    at column 0 after leading spaces / transparent spaces (for decoders that
+    ignore the column, like the Channels app on tvOS)."""
     pairs = [RCL, RCL, ENM, ENM]
     last_row = POSITIONS.get(position, ROWS)
     first_row = last_row - len(lines) + 1
     for i, line in enumerate(lines):
-        pairs += _pac(first_row + i, (COLS - len(line)) // 2)
+        col = (COLS - len(line)) // 2
+        if centre == "pac":
+            pairs += _pac(first_row + i, col)
+        else:
+            pairs += _pac(first_row + i, 0)
+            if centre == "tsp":
+                pairs += [TSP] * 2 * col
+            else:
+                line = " " * col + line
         chars = []
         for c in line + "\0":
             if c in SPECIAL or c == "\0":
@@ -315,7 +335,7 @@ class Encoder:
                 self.cues.pop(0)  # too late to show at all
             if self.cues:
                 cue = self.cues[0]
-                pairs = cue_pairs(cue.lines, cue.position)
+                pairs = cue_pairs(cue.lines, cue.position, CENTRE_608.get(cue.pad, "pac"))
                 lead = (len(pairs) + 10) * self.frame_ticks
                 if pts >= cue.start - lead:
                     self.cues.pop(0)

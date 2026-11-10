@@ -179,7 +179,7 @@ class Guide:
         if not self.xml_translated:
             # Nothing translated yet: publish the original-language guide now.
             self.publish(out, [ET.tostring(el, encoding="unicode") for el in elements], matches)
-        if TRANSLATE:
+        if TRANSLATE():
             t0 = time.monotonic()
             n = self.translator.translate_programmes(elements, langs)
             if n is not None:
@@ -219,7 +219,10 @@ def xmltv_time(s):
 
 # ------------------------------------------------------------ translate ---
 
-TRANSLATE = os.environ.get("EPG_TRANSLATE", "1") == "1"
+# EPG_TRANSLATE=1: translate the guide into English with NLLB on this
+# machine's CPU (off by default); relay.py downloads the model if it's missing.
+TRANSLATE = lambda: os.environ.get("EPG_TRANSLATE", "0") == "1"  # noqa: E731
+MODEL_MISSING = lambda: None  # noqa: E731
 CACHE = os.environ.get("EPG_CACHE", os.path.join(
     os.path.dirname(os.environ.get("CHANNELS_FILE", "/config/channels.json")), "epg_translations.sqlite"))
 
@@ -301,11 +304,15 @@ class Translator:
         self.mt = None
 
     def _ready(self):
+        import nllbget
+        if self.mt is False and nllbget.installed():
+            self.mt = None   # downloaded since (web page or captions-dvr-get-nllb)
         if self.mt is None:
             try:
                 import asr
-                path = os.environ.get("NLLB_MODEL", "/models/nllb-200-distilled-1.3B-ct2")
+                path = nllbget.default_path()
                 if not os.path.exists(os.path.join(path, "model.bin")):
+                    MODEL_MISSING()   # downloads it in the background; translated from the next refresh
                     self.mt = False
                     return False
                 self.mt = asr.NLLB(path, int(os.environ.get("EPG_NLLB_THREADS", "2")))

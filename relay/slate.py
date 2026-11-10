@@ -19,6 +19,8 @@ import os
 import re
 import threading
 
+from fractions import Fraction
+
 import av
 import numpy as np
 from PIL import Image, ImageDraw
@@ -30,6 +32,7 @@ log = logging.getLogger("slate")
 
 SEG = 2.0                 # seconds per slate segment
 SLATE_SECONDS = 50        # cached length; enough for a slow source to start (below the 60 s timeline start)
+QUICK_SECONDS = 4         # quick() renders this much first (two segments)
 CACHE_DIR = os.environ.get("SLATE_DIR", "")
 DEFAULT = {"width": 1920, "height": 1080, "fps": 25, "sample_rate": 48000, "channels": 2, "profile": "High",
            "vcodec": "h264", "acodec": "aac"}
@@ -42,7 +45,7 @@ def _key(fmt):
     return "slate-{width}x{height}-{fps}-{sample_rate}-{channels}-{p}{c}".format(
         p=re.sub(r"\W", "", fmt.get("profile") or "High").lower(),
         c="" if (fmt.get("vcodec"), fmt.get("acodec")) == ("h264", "aac") else f"-{fmt.get('vcodec')}-{fmt.get('acodec')}",
-        **fmt)
+        **fmt) + ("-ntsc" if fmt.get("vcodec") == "mpeg2video" else "")   # (cards before 29.97 had none)
 
 
 def _formats_path():
@@ -57,6 +60,14 @@ def _formats():
         return {}
 
 
+def _write(path, data):
+    """Replace a cache file in one step (each channel's worker process writes here)."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def remember(ch_id, fmt):
     """Note a channel's source format (for its next cold start), and render its card."""
     known = _formats()
@@ -64,8 +75,7 @@ def remember(ch_id, fmt):
         known[ch_id] = fmt
         try:
             os.makedirs(CACHE_DIR, exist_ok=True)
-            with open(_formats_path(), "w") as f:
-                json.dump(known, f)
+            _write(_formats_path(), json.dumps(known).encode())
         except OSError as e:
             log.warning("can't save slate formats: %s", e)
     if _cached(_key(fmt)) is None:
@@ -164,16 +174,23 @@ def segments(fmt):
         if path:
             try:
                 os.makedirs(CACHE_DIR, exist_ok=True)
-                with open(path[:-5] + ".ts", "wb") as f:
-                    f.write(b"".join(s for _, s, _ in segs))
-                with open(path, "w") as f:
-                    json.dump([(d, len(s), p) for d, s, p in segs], f)
+                _write(path[:-5] + ".ts", b"".join(s for _, s, _ in segs))
+                _write(path, json.dumps([(d, len(s), p) for d, s, p in segs]).encode())
             except OSError as e:
                 log.warning("can't cache slate: %s", e)
         return segs
 
 
-def render(fmt):
+def quick(fmt):
+    """A first few seconds of the slate, rendered at once (a 1080i card takes
+    about 8 s in full), while the full one renders in the background: so a
+    first tune of a new format doesn't leave the player without segments.
+    run_slate moves on to the full card when the quick one runs out."""
+    threading.Thread(target=segments, args=(fmt,), name="slate", daemon=True).start()
+    return render(fmt, QUICK_SECONDS)
+
+
+def render(fmt, seconds=None):
     w, h, fps = fmt["width"] // 2 * 2, fmt["height"] // 2 * 2, int(round(fmt["fps"])) or 25
     img = Image.new("RGB", (w, h), (18, 20, 28))
     d = ImageDraw.Draw(img)
@@ -190,9 +207,14 @@ def render(fmt):
         v.width, v.height, v.pix_fmt = w, h, "yuv420p"
         v.options = {"preset": "veryfast", "x265-params": f"keyint={int(fps * SEG)}:min-keyint={int(fps * SEG)}:scenecut=0:log-level=error"}
     elif fmt.get("vcodec") == "mpeg2video":   # broadcast (e.g. HDHomeRun): match it
-        v = out.add_stream("mpeg2video", rate=fps)
+        # NTSC/ATSC rates are 1000/1001 of 24/30/60 (MPEG-2 allows no others
+        # besides 25/50, the PAL ones); 1080 lines is 1080i.
+        v = out.add_stream("mpeg2video", rate=Fraction(fps * 1000, 1001) if fps in (24, 30, 60) else fps)
         v.width, v.height, v.pix_fmt = w, h, "yuv420p"
         v.options = {"g": str(int(fps * SEG)), "b": "1500k"}
+        if h == 1080:
+            v.codec_context.flags |= av.codec.context.Flags.interlaced_dct | av.codec.context.Flags.interlaced_me
+            v.options["top"] = "1"
     else:
         v = out.add_stream("libx264", rate=fps)
         v.width, v.height, v.pix_fmt = w, h, "yuv420p"
@@ -206,12 +228,13 @@ def render(fmt):
     fsize = a.codec_context.frame_size or 1024
     silence = np.zeros((2 if layout == "stereo" else 1, fsize), dtype=np.float32)
     samples = 0
-    for i in range(int(SLATE_SECONDS * fps)):
+    vrate = float(v.codec_context.framerate or fps)
+    for i in range(int((seconds or SLATE_SECONDS) * vrate)):
         vf = av.VideoFrame.from_ndarray(frame_img, format="rgb24").reformat(format="yuv420p")
         vf.pts = i
         for p in v.encode(vf):
             out.mux(p)
-        while samples < (i + 1) * fmt["sample_rate"] / fps:
+        while samples < (i + 1) * fmt["sample_rate"] / vrate:
             af = av.AudioFrame.from_ndarray(silence, format="fltp", layout=layout)
             af.sample_rate, af.pts = fmt["sample_rate"], samples
             for p in a.encode(af):

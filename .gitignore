@@ -3,3 +3,7 @@ __pycache__/
 archive/
 config/
 .env
+dist/
+relay/channels.json
+.clips/
+tests/report/

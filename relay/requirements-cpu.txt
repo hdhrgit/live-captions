@@ -1,0 +1,4 @@
+# ASR server on a CPU (ASR_BACKEND=cpu): faster-whisper in int8, NLLB via
+# CTranslate2. No torch: Seamless doesn't run on the CPU.
+-r requirements.txt
+faster-whisper>=1.1

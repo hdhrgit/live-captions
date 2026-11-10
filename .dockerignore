@@ -1,0 +1,5 @@
+config/
+archive/
+work/
+dist/
+.env*

@@ -6,6 +6,7 @@ compression_ratio?}], "speech_ratio": float|None}, times in seconds from the
 start of the chunk. The guard is applied by
 the relay, so it behaves the same whatever backend produced the segments.
 """
+import collections
 import io
 import json
 import logging
@@ -319,8 +320,58 @@ class NLLB:
         return out
 
 
+BATCHES = collections.Counter()   # (model, batch size) -> batches decoded (asr_server /metrics)
+
+
+class Batcher:
+    """Runs fn(items) -> results over the requests waiting, up to max_size
+    with the same key at a time: requests that arrive while a batch runs go
+    together into the next one, and a lone request never waits. Decoding
+    one chunk at a time, token by token, kept an NVIDIA GPU half idle."""
+
+    def __init__(self, name, fn, max_size, key=lambda item: None):
+        self.name, self.fn, self.max, self.key = name.split("-")[0], fn, max(1, max_size), key
+        self.cv = threading.Condition()
+        self.jobs = []   # [item, Event, result or exception]
+        threading.Thread(target=self.loop, name=name, daemon=True).start()
+
+    def run(self, item):
+        job = [item, threading.Event(), None]
+        with self.cv:
+            self.jobs.append(job)
+            self.cv.notify()
+        job[1].wait()
+        if isinstance(job[2], Exception):
+            raise job[2]
+        return job[2]
+
+    def loop(self):
+        while True:
+            with self.cv:
+                while not self.jobs:
+                    self.cv.wait()
+                k = self.key(self.jobs[0][0])
+                batch = [j for j in self.jobs if self.key(j[0]) == k][:self.max]
+                for j in batch:
+                    self.jobs.remove(j)
+            BATCHES[(self.name, len(batch))] += 1
+            try:
+                results = self.fn([j[0] for j in batch])
+            except Exception as e:  # noqa: BLE001 - every request in the batch gets it
+                results = [e] * len(batch)
+            for j, r in zip(batch, results):
+                j[2] = r
+                j[1].set()
+
+
+def batch_size(model):
+    """Most requests decoded together: <MODEL>_BATCH, else ASR_BATCH, else 8."""
+    return max(1, int(os.environ.get(f"{model.upper()}_BATCH") or os.environ.get("ASR_BATCH") or 8))
+
+
 class Seamless:
-    """SeamlessM4T v2 speech -> English text (PyTorch; MPS on Apple Silicon)."""
+    """SeamlessM4T v2 speech -> English text (PyTorch; MPS on Apple Silicon).
+    Requests are decoded in batches (Batcher, SEAMLESS_BATCH)."""
 
     def __init__(self, path):
         import torch
@@ -335,14 +386,18 @@ class Seamless:
         self.proc = AutoProcessor.from_pretrained(path)
         self.model = SeamlessM4Tv2ForSpeechToText.from_pretrained(path, torch_dtype=dtype).to(self.device).eval()
         self.dtype = dtype
+        self.batcher = Batcher("seamless-batch", self.decode, batch_size("seamless"))
 
     def translate(self, audio):
+        return self.batcher.run(audio)
+
+    def decode(self, audios):
         with self.torch.inference_mode():
-            inputs = self.proc(audio=audio, sampling_rate=SR, return_tensors="pt")
+            inputs = self.proc(audio=audios, sampling_rate=SR, return_tensors="pt", padding=True)
             inputs = {k: (v.to(self.device, self.dtype) if v.is_floating_point() else v.to(self.device))
                       for k, v in inputs.items()}
             ids = self.model.generate(**inputs, tgt_lang="eng", max_new_tokens=MAX_TOKENS)
-        return self.proc.decode(ids[0].tolist(), skip_special_tokens=True).strip()
+        return [self.proc.decode(x.tolist(), skip_special_tokens=True).strip() for x in ids]
 
 
 _seamless, _seamless_lock = None, threading.Lock()
@@ -356,7 +411,8 @@ def seamless():
     """The shared Seamless model, or None if SEAMLESS_MODEL isn't installed."""
     global _seamless
     with _seamless_lock:
-        if _seamless is None and os.path.exists(os.path.join(seamless_path(), "config.json")):
+        if (_seamless is None and os.environ.get("ASR_BACKEND") != "cpu"
+                and os.path.exists(os.path.join(seamless_path(), "config.json"))):
             log.info("loading Seamless from %s", seamless_path())
             _seamless = Seamless(seamless_path())
         return _seamless
@@ -388,13 +444,14 @@ def speech_ratio(audio):
 
 class CudaWhisper(Whisper):
     """faster-whisper on an NVIDIA GPU (ASR_BACKEND=cuda, for asr_server.py on
-    a Linux box; tested on an RTX 3060, see docs/NVIDIA.md). The model is loaded once."""
+    a Linux box; tested on an RTX 3060, see docs/NVIDIA.md), or on the CPU in
+    int8 (ASR_BACKEND=cpu, ASR_THREADS). The model is loaded once."""
 
     _model = None
     _lock = threading.Lock()
 
-    def __init__(self, model="large-v3", beam=1):
-        self.name, self.beam = model, beam
+    def __init__(self, model="large-v3", beam=1, device="cuda"):
+        self.name, self.beam, self.device = model, beam, device
 
     def _get(self):
         with self._lock:
@@ -402,12 +459,30 @@ class CudaWhisper(Whisper):
                 from faster_whisper import WhisperModel
                 log.info("loading model %s", self.name)
                 CudaWhisper._model = WhisperModel(
-                    self.name, device="cuda", compute_type="float16",
+                    self.name, device=self.device, compute_type="float16" if self.device == "cuda" else "int8",
+                    cpu_threads=int(os.environ.get("ASR_THREADS", "0")),
+                    # decodes side by side (batches, and the unbatched retries);
+                    # more than 2 only made them fight over the GPU (RTX 3060)
+                    num_workers=max(1, int(os.environ.get("WHISPER_WORKERS", "2"))),
                     download_root=os.environ.get("MODEL_DIR", "/models"))
                 log.info("model ready")
             return CudaWhisper._model
 
+    _batcher = None
+
     def decode(self, audio, language, task, temperatures):
+        # Known language, first (greedy) try: batched with other requests of
+        # the same language and task. A looping decode falls back to the
+        # warmer temperatures one at a time, as does language detection.
+        if language and temperatures and temperatures[0] == 0 and batch_size("whisper") > 1:
+            with self._lock:
+                if CudaWhisper._batcher is None:
+                    CudaWhisper._batcher = Batcher("whisper-batch", self.decode_batch, batch_size("whisper"),
+                                                   key=lambda item: item[1:])
+            segs = CudaWhisper._batcher.run((audio, language, task))
+            if segs is not None:
+                return segs, {"language": language, "language_probability": None}
+            temperatures = temperatures[1:] or (0.4,)
         segs, info = self._get().transcribe(
             audio, language=language, task=task, beam_size=self.beam,
             temperature=list(temperatures), compression_ratio_threshold=2.4,
@@ -418,6 +493,47 @@ class CudaWhisper(Whisper):
                  "compression_ratio": s.compression_ratio} for s in segs]
         return segs, {"language": info.language,
                       "language_probability": round(info.language_probability, 3)}
+
+
+    def decode_batch(self, items):
+        """[(audio, language, task)] of one language and task -> segments for
+        each, or None where the text loops (compression ratio > 2.4)."""
+        from faster_whisper.audio import pad_or_trim
+        from faster_whisper.tokenizer import Tokenizer
+        from faster_whisper.transcribe import get_compression_ratio, get_suppressed_tokens
+        m = self._get()
+        _, language, task = items[0]
+        tok = Tokenizer(m.hf_tokenizer, m.model.is_multilingual, task=task, language=language)
+        enc = m.encode(np.stack([pad_or_trim(m.feature_extractor(a)) for a, _, _ in items]))
+        prompt = m.get_prompt(tok, [], without_timestamps=False)
+        results = m.model.generate(
+            enc, [prompt] * len(items), beam_size=self.beam, max_length=len(prompt) + MAX_TOKENS,
+            return_scores=True, return_no_speech_prob=True, suppress_blank=True,
+            suppress_tokens=get_suppressed_tokens(tok, [-1]),
+            max_initial_timestamp_index=int(round(1.0 / m.time_precision)))
+        out = []
+        for (audio, _, _), r in zip(items, results):
+            tokens = r.sequences_ids[0]
+            text = tok.decode([t for t in tokens if t < tok.eot]).strip()
+            ratio = get_compression_ratio(text)
+            if ratio > 2.4:
+                out.append(None)
+                continue
+            avg = r.scores[0] * len(tokens) / (len(tokens) + 1)
+            dur, segs, start, buf = len(audio) / SR, [], 0.0, []
+            for t in tokens + [tok.timestamp_begin + round(dur / m.time_precision)]:
+                if t >= tok.timestamp_begin:   # a timestamp: closes the text before it
+                    ts = min(dur, (t - tok.timestamp_begin) * m.time_precision)
+                    if buf:
+                        segs.append({"start": start, "end": max(ts, start), "text": tok.decode(buf),
+                                     "no_speech_prob": r.no_speech_prob, "avg_logprob": avg,
+                                     "compression_ratio": ratio})
+                        buf = []
+                    start = ts
+                elif t < tok.eot:
+                    buf.append(t)
+            out.append(segs)
+        return out
 
 
 class MlxWhisper(Whisper):
@@ -473,14 +589,13 @@ class Remote:
             self._api_at = time.monotonic()
         return self._api
 
-    def transcribe(self, audio, language="ko", task="translate", mt="whisper", timeout=None):
+    def transcribe(self, audio, language="ko", task="translate", mt="whisper", timeout=None, due=None):
         if self.api() < 2 and (language != "ko" or task != "translate"):
             # Version 1 servers only did Korean -> English.
             raise Unsupported("remote ASR is API v1 (Korean translate only)")
         q = f"language={language or 'auto'}&task={task}&mt={mt}"
         req = urllib.request.Request(
-            f"{self.url}/v1/translate?{q}", data=wav_bytes(audio),
-            headers={"Content-Type": "audio/wav"}, method="POST")
+            f"{self.url}/v1/translate?{q}", data=wav_bytes(audio), headers=_headers(due), method="POST")
         with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
             r = json.load(r)
             return {"segments": r["segments"], "speech_ratio": r.get("speech_ratio"),
@@ -488,11 +603,17 @@ class Remote:
                     "language_probability": r.get("language_probability")}
 
 
-def remote_multi(self, audio, language, tracks, timeout=None):
+def _headers(due):
+    """Request headers; due (time.monotonic()) is when the caption is needed,
+    for the relay's own ASR queue (relay.py, per-channel worker processes)."""
+    return {"Content-Type": "audio/wav", **({"X-Due": f"{due:.3f}"} if due else {})}
+
+
+def remote_multi(self, audio, language, tracks, timeout=None, due=None):
     """POST /v1/multi (API v4): every track for one chunk in one request."""
     q = f"language={language or 'auto'}&tracks={','.join(tracks)}"
     req = urllib.request.Request(f"{self.url}/v1/multi?{q}", data=wav_bytes(audio),
-                                 headers={"Content-Type": "audio/wav"}, method="POST")
+                                 headers=_headers(due), method="POST")
     with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
         return json.load(r)
 
@@ -519,6 +640,8 @@ def from_env():
         return MlxWhisper(os.environ.get("MODEL", "mlx-community/whisper-large-v3-mlx"))
     if kind == "cuda":
         return CudaWhisper(os.environ.get("MODEL", "large-v3"), int(os.environ.get("BEAM", "1")))
+    if kind == "cpu":
+        return CudaWhisper(os.environ.get("MODEL", "large-v3-turbo"), int(os.environ.get("BEAM", "1")), "cpu")
     if kind == "remote":
         return Remote(os.environ["ASR_URL"], float(os.environ.get("ASR_TIMEOUT", "15")))
     if kind == "none":

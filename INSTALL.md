@@ -71,9 +71,22 @@ launchctl bootout gui/$(id -u)/com.captions-dvr.asr          # stop and unload
 
 ## 2. Channels DVR box (dvr-host): relay
 
-Requirements: Debian or Ubuntu with systemd, plus `python3` and `python3-venv`
-(`sudo apt install python3 python3-venv git`). No ffmpeg is needed, because
-PyAV bundles it.
+Requirements: Debian or Ubuntu with systemd. No ffmpeg is needed, because
+PyAV bundles it. (ATSC 3.0 channels with AC-4 audio need an ffmpeg that can
+decode AC-4, such as Channels DVR's own: set its path as "Audio ffmpeg" in
+the web page. Debian's ffmpeg can't.)
+
+As a Debian package (architecture-independent; installing downloads PyAV and
+the other Python packages, so it needs internet): download
+`captions-dvr_<version>_all.deb` from the GitHub release, then
+
+```sh
+sudo apt install ./captions-dvr_<version>_all.deb
+```
+
+or build it from a checkout with `deploy/build-deb.sh` (it lands in `dist/`).
+
+Or from a checkout (`sudo apt install python3 python3-venv git`):
 
 ```sh
 git clone <repository-url> ~/captions-dvr
@@ -91,17 +104,30 @@ ASR_BACKEND=remote
 ASR_URL=http://<mac-ip>:8096              # the Mac service from step 1
 ```
 
-Channels are configured in `/etc/captions-dvr/channels.json` (KCTV, Ryongnamsan,
-Sports, KCTV backup; numbers 8501–8504). Apply changes with:
+Sources and channels are picked in the web page at `http://dvr-host:8095/`
+(stored in `/var/lib/captions-dvr/channels.json`). Apply changes to the env
+file with:
 
 ```sh
 sudo systemctl restart captions-dvr
 journalctl -u captions-dvr -f
 ```
 
-The service runs as user `captions-dvr` from `/opt/captions-dvr`, at `Nice=5`.
+The service runs as user `captions-dvr` from `/opt/captions-dvr`, at `Nice=5`,
+one process per channel being watched.
+`sudo apt remove captions-dvr` keeps the settings and channels; `purge`
+removes them too.
 It uses about 10–15% of one J4125 core and 55 MB of RAM per channel being
 watched, and nothing while idle.
+
+### English guide (optional)
+
+The relay can translate the programme guide (`epg.xml`) into English with
+NLLB-200 on its own CPU (cached, so only new programmes cost time). Set
+`EPG_TRANSLATE=1` in `/etc/captions-dvr/captions-dvr.env` and restart; the
+first time it downloads the model (1.4 GB, CC-BY-NC) into
+`/var/lib/captions-dvr/models` by itself. To fetch it beforehand:
+`sudo captions-dvr-get-nllb`. Off by default; captions don't need it.
 
 ## 3. Channels DVR
 
@@ -109,10 +135,10 @@ In Settings > Sources > Add Source > Custom Channels:
 
 - Name: `captions-dvr`
 - Stream Format: **HLS**
-- Source: URL, `http://dvr-host:8095/playlist-hls.m3u`
+- Source: URL, `http://dvr-host:8095/playlist.m3u`
 - XMLTV Guide Data: `http://dvr-host:8095/epg.xml`
-- Optionally set Prefer channel-number from M3U, so the channels land on
-  8501 onwards.
+- Optionally set Prefer channel-number from M3U, so the channels keep the
+  numbers you give them in the relay's web page.
 
 Pick channels in the relay's web page (http://dvr-host:8095/, "Sources &
 channels"); Channels picks them up on its next source refresh. In the Channels
@@ -121,8 +147,8 @@ off by default; turn on "EIA CC" per channel if a client needs it. Channels
 whose source has its own English captions pass those through as CC.) Subtitles start about 15 s after tuning, run
 about 20–30 s behind the live source, and are kept in recordings.
 
-Use only one captions-dvr source: an older MPEG-TS source on
-`/playlist.m3u` has the same channel numbers, so remove or disable it.
+Use only one captions-dvr source. (`/playlist-hls.m3u`, the older name, is
+the same playlist.)
 
 Or keep the channel list in Channels instead (stateless mode, see README):
 Source URL `http://dvr-host:8095/api/m3u?url=<url-encoded M3U>`, Stream
@@ -133,7 +159,7 @@ get N.1, N.2 variants per backend.
 
 ```sh
 curl http://<mac-ip>:8096/health                 # speech service up
-curl http://dvr-host:8095/playlist-hls.m3u  # enabled channels
+curl http://dvr-host:8095/playlist.m3u  # enabled channels
 curl -s http://dvr-host:8095/status         # per-channel state
 ```
 
@@ -146,11 +172,11 @@ While a channel is being watched, its entry in `/status` shows:
 - in `dropped`, a growing `asr_error` count, which means the relay can't reach
   the Mac or the Mac is too slow (check `ASR_URL` and the Mac log)
 
-If you don't have a player handy, a quick test from any machine with ffmpeg:
+If you don't have a player handy, a quick test from any machine with curl:
+the newest subtitle segment of a channel (repeat until it has cues):
 
 ```sh
-timeout 90 curl -s http://dvr-host:8095/kctv.ts -o t.ts
-ffmpeg -f lavfi -i "movie=t.ts[out0+subcc]" -map 0:s t.srt && cat t.srt
+curl -s http://dvr-host:8095/hls/<id>/subs.m3u8 | tail -1 | xargs curl -s
 ```
 
 ## Docker (a Docker host)

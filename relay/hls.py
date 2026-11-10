@@ -24,6 +24,14 @@ TARGET = 6.0
 KEEP = 15   # segments in the playlist (~30 s)
 IDLE = 60.0
 VIDEO_PID = 0x100
+# Optional blank cue (CUE_BLANK, its text; off by default) 0.1 s long after
+# a caption that 3 s or more of silence follows, for players that keep the
+# last caption up until another replaces it. Channels DVR drops cues of only
+# (no-break) spaces, and the Channels app on tvOS drew a zero-width space as
+# an empty caption box that stayed up just the same.
+BLANK, BLANK_GAP = 9000, 270000
+BLANK_TEXT = os.environ.get("CUE_BLANK", "")
+TABLE_PIDS = (0x0000, 0x1000)   # PAT, and the PMT where libavformat's muxer puts it
 # libavformat's mpegts muxer adds max_delay (0.7 s) to every PTS it writes;
 # cue times are on the relay's clock, before that offset.
 MUX_DELAY = 63000
@@ -70,6 +78,11 @@ def pes_pts(pkt):
     return (((p[9] >> 1) & 7) << 30 | p[10] << 22 | (p[11] >> 1) << 15 | p[12] << 7 | p[13] >> 1)
 
 
+def head(tables):
+    """PAT then PMT, from {pid: packet}."""
+    return b"".join(tables[p] for p in TABLE_PIDS if p in tables)
+
+
 def fmt(t):
     t = max(0.0, t)
     return f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{t % 60:06.3f}"
@@ -93,8 +106,7 @@ class Segmenter:
         s = channel.session
         # (A tuner of a format not seen before: run_slate waits for the
         # session to read it, then picks or renders a matching card.)
-        self.slate_on = (s is None or getattr(s, "anchor", None) is None) and (
-            slate.get(channel) is not None or ".m3u" not in (channel.cfg.get("url") or "").split("?")[0])
+        self.slate_on = s is None or getattr(s, "anchor", None) is None
         # Video comes from the channel (passthrough) or, in compare mode,
         # from its burn.Burner; run() follows the channel's setting.
         self.src = channel.video_source()
@@ -107,36 +119,49 @@ class Segmenter:
     def run_slate(self):
         """Slate segments: two at once, then one per segment length, until the
         first real segment (run() turns slate_on off) or the slate runs out."""
-        segs = slate.get(self.ch)
-        for _ in range(20):   # up to 5 s for the session to open the source
+        # A format seen before: its card at once. A new one: wait (up to 5 s)
+        # for the session to open the source, so the card is in its codec and
+        # size (an H.264 card before MPEG-2 can show green), else take the
+        # closest cached one.
+        segs = slate.get(self.ch) if slate.fmt_of(self.ch) else None
+        for _ in range(20):
             if segs or getattr(self.ch, "source_format", None):
                 break
             time.sleep(0.25)
-            segs = slate.get(self.ch)
         if not segs and getattr(self.ch, "source_format", None):
-            segs = slate.segments(slate.fmt_of(self.ch))   # render it now
+            fmt = slate.fmt_of(self.ch)   # exactly its format; quick: a few seconds now, the rest later
+            segs = slate._cached(slate._key(fmt)) or slate.quick(fmt)
+        if not segs:
+            segs = slate.get(self.ch)
         if not segs:
             with self.lock:
                 self.slate_on = False
             return
-        s = self.ch.session
-        lang = getattr(s, "language", None) or (self.ch.cfg.get("language") or "auto")
-        what = (f"{LABELS.get(main_mt(self.ch.cfg), '')} subtitles, {LANG_NAMES.get(lang, lang)}"
-                if lang != "auto" else "detecting language")
-        text = (f"{self.ch.name} - " if self.ch.name else "") + f"{what} - starting..."
         t0 = time.monotonic()
-        for k, (dur, data, pts) in enumerate(segs):
+        k = 0
+        while True:
+            if k >= len(segs):
+                # A quick card ran out: go on with the full one, in the same
+                # format (same picture and timestamps), once it's rendered.
+                fmt, more = slate.fmt_of(self.ch), None
+                for _ in range(int(2 * slate.SEG / 0.25)):
+                    more = slate._cached(slate._key(fmt)) if fmt else None
+                    if more or not self.slate_on:
+                        break
+                    time.sleep(0.25)
+                if not more or len(more) <= k:
+                    return
+                segs = more
+            dur, data, pts = segs[k]
             with self.lock:
                 if not self.slate_on:
                     return
                 self.segments.append((self.seq, pts, dur, data))
                 self.seq += 1
                 self.ch.hls_next_seq = self.seq
-                cues = self.ch.vtt_tracks.get("main")
-                if cues is not None and (not cues or cues[-1][0] < pts - MUX_DELAY):
-                    cues.append((pts - MUX_DELAY, pts - MUX_DELAY + int(dur * 90000), text))
             if k >= 1:
                 time.sleep(max(0.0, t0 + (k * dur) - time.monotonic()))
+            k += 1
 
     def run(self):
         # Segments are PIECE-second pieces cut at any video frame (they decode
@@ -145,6 +170,12 @@ class Segmenter:
         # 6-10 s interval to close (that stalled it right after a cold start).
         # Only the first segment after a discontinuity starts at a keyframe.
         buf, start, rest, last = bytearray(), None, b"", 0
+        # The latest PAT and PMT, put at the start of every segment: a
+        # segment cut at a frame otherwise has them only ~0.1 s in, and
+        # Channels DVR drops what comes before them after a discontinuity,
+        # keyframe included (Android then smeared the next frames over the
+        # slate card).
+        tables = {}
         while time.monotonic() - self.last_request < IDLE:
             want = self.ch.video_source()
             if want is not self.src:
@@ -154,7 +185,7 @@ class Segmenter:
                 self.src.unsubscribe(self.cq)
                 self.src, self.cq = want, cq
                 if start is not None and len(buf) > 188 * 100:
-                    self.append(start, max(0.1, (last - start) / 90000), bytes(buf))
+                    self.append(start, max(0.1, (last - start) / 90000), head(tables) + bytes(buf))
                 with self.lock:
                     self.disc.add(self.seq)
                 buf, start, rest = bytearray(), None, b""
@@ -163,7 +194,17 @@ class Segmenter:
             except Exception:  # noqa: BLE001 - queue.Empty: keep waiting
                 continue
             if chunk is None:
-                break
+                # Dropped as a slow client (the queue overflowed): bytes were
+                # lost, so resubscribe and carry on from the next keyframe as
+                # a discontinuity. Exiting would empty the playlist and make
+                # the next segmenter's sequence jump, which resets the DVR.
+                log.warning("%s: segmenter fell behind, resuming at the next keyframe", self.ch.id)
+                self.ch.segmenter_resumes = getattr(self.ch, "segmenter_resumes", 0) + 1
+                self.cq = self.src.subscribe()
+                with self.lock:
+                    self.disc.add(self.seq)
+                buf, start, rest = bytearray(), None, b""
+                continue
             data = rest + chunk
             n = len(data) // 188 * 188
             rest = data[n:]
@@ -181,7 +222,7 @@ class Segmenter:
                             # Timestamps jumped (session restarted): close the
                             # segment here and mark the next one discontinuous.
                             if len(buf) > 188 * 100:
-                                self.append(start, max(0.1, (last - start) / 90000), bytes(buf))
+                                self.append(start, max(0.1, (last - start) / 90000), head(tables) + bytes(buf))
                             with self.lock:
                                 self.disc.add(self.seq)
                             start, buf = None, bytearray()
@@ -190,9 +231,11 @@ class Segmenter:
                                 continue   # a new segment run starts at a keyframe
                             start, buf = pts, bytearray()
                         elif pts - start >= PIECE * 90000:
-                            self.append(start, (pts - start) / 90000, bytes(buf))
+                            self.append(start, (pts - start) / 90000, head(tables) + bytes(buf))
                             start, buf = pts, bytearray()
                         last = pts
+                elif ((pkt[1] & 0x1F) << 8 | pkt[2]) in TABLE_PIDS:
+                    tables[(pkt[1] & 0x1F) << 8 | pkt[2]] = pkt
                 if start is not None:
                     buf += pkt
         self.src.unsubscribe(self.cq)
@@ -301,15 +344,29 @@ class Segmenter:
         # MPEGTS:0 = LOCAL 0 and cue times on the (33-bit) PTS clock.
         lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000", ""]
         line = VTT_LINE.get(self.ch.cfg.get("cc_position") or "bottom", "85%")
-        for cs, ce, text in sorted(self.ch.vtt_tracks.get(track, ())):
+        cues = sorted(self.ch.vtt_tracks.get(track, ()))
+        # A blank cue where a cue ends with nothing right after it: some players (Channels on iPhone
+        # and Apple TV, through the DVR) keep showing the last cue until
+        # another one replaces it, so a caption stayed up through silence or
+        # an ASR outage.
+        timed = []
+        for i, (cs, ce, text) in enumerate(cues):
+            timed.append((cs, ce, text))
+            nxt = cues[i + 1][0] if i + 1 < len(cues) else None
+            if BLANK_TEXT and (nxt is None or nxt - ce >= BLANK_GAP):
+                timed.append((ce, ce + BLANK if nxt is None else min(ce + BLANK, nxt - 1800), BLANK_TEXT))
+        base = start / 90000
+        out = []
+        for cs, ce, text in timed:
             a = wrap_diff(cs + MUX_DELAY, start) / 90000
             b = wrap_diff(ce + MUX_DELAY, start) / 90000
             # Each cue only in the segment where it starts (it may run past
             # the segment end): repeating it in the next segment makes some
             # players (Fire TV) draw it twice.
             if 0 <= a < dur:
-                base = start / 90000
-                lines += [f"{fmt(base + a)} --> {fmt(base + b)} align:center line:{line}", text, ""]
+                out.append((a, b, text))
+        for a, b, text in out:
+            lines += [f"{fmt(base + a)} --> {fmt(base + b)} align:center line:{line}", text, ""]
         return "\n".join(lines) + "\n"
 
 

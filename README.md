@@ -10,8 +10,7 @@ for all) the same captions are also embedded in the video as CEA-608 and
 CEA-708 (A/53 SEI); Channels doesn't need them. The video is never re-encoded.
 
 ```
-source ──► relay ─┬─ video/audio ── delay ~20 s ── + 608/708 SEI ──┬─► HLS /hls/<id>/ (TS segments + WebVTT)
-                  │                                                 └─► MPEG-TS /<id>.ts
+source ──► relay ─┬─ video/audio ── delay ~20 s ── (+ 608/708 SEI) ──► HLS /hls/<id>/ (TS segments + WebVTT)
                   └─ audio 16 kHz ─► ASR backend (Mac: Seamless | mlx-whisper + NLLB; NVIDIA; none)
 ```
 
@@ -19,24 +18,31 @@ source ──► relay ─┬─ video/audio ── delay ~20 s ── + 608/708
 
 | Path | What |
 |---|---|
-| `/playlist-hls.m3u` | **Default.** M3U for a Channels DVR Custom Channel, Stream Format **HLS**: each channel with an English WebVTT subtitle track |
+| `/playlist.m3u` | M3U for a Channels DVR Custom Channel, Stream Format **HLS**: each channel with an English WebVTT subtitle track (`/playlist-hls.m3u` is the same) |
 | `/hls/<id>/master.m3u8` | One channel as HLS (6 s TS segments, `subs.m3u8` WebVTT rendition) |
-| `/epg.xml` | XMLTV guide for the enabled channels, translated to English |
-| `/playlist.m3u`, `/<id>.ts` | The same channels as plain MPEG-TS with embedded 608/708 only (Stream Format MPEG-TS) |
+| `/epg.xml` | XMLTV guide for the enabled channels (translated to English with `EPG_TRANSLATE=1`) |
 | `/` | Web page: live status, sources and channel picker, per-channel settings |
 | `/status` | JSON: per-channel session state, ASR speed, dropped-segment counts, recent captions |
+| `/metrics` | Prometheus text format (Netdata, Prometheus): per-channel ASR time, lead, captions, drops, worker CPU/RAM; the ASR server has its own (docs/NVIDIA.md) |
 
 Channels run on demand: the first client starts the pull and ASR, and the
-session stops `GRACE` seconds after the last client leaves. A session starts
+session stops `GRACE` seconds after the last client leaves. Each running
+channel has its own worker process (so channels use separate CPU cores); the
+main process serves the web page and playlists, and queues every channel's
+ASR requests, nearest deadline first. A session starts
 from the HLS backlog, so clients get data straight away. Captions for the first
 ~15 s after a tune may be missing.
 
 ## Channels
 
-`channels.json` (`CHANNELS_FILE`):
+`channels.json` (`CHANNELS_FILE`) holds the sources, channels and settings;
+the web page writes it, and a new install starts with none. A hand-written
+list of channels works too (`examples/channels.example.json`):
 
 ```json
-[{"id": "kctv", "number": 8501, "name": "KCTV (English CC)",
+[{"id": "livenow", "number": 8501, "name": "LiveNOW from FOX", "language": "en",
+  "source": "https://fox-foxnewsnow-vizio.amagi.tv/playlist.m3u8"},
+ {"id": "kctv", "number": 8502, "name": "KCTV", "language": "ko",
   "source": "https://live.koryocdn.org/kctv/index.m3u8"}]
 ```
 
@@ -113,6 +119,9 @@ Parameters (both endpoints; `/api/m3u` passes them on):
 - `pos=bottom|middle|top` subtitle position.
 - `compare=1` compare mode (backends burned in, with the relay's Compare
   settings).
+- `chunk=long` long chunks: 20-28 s instead of 4-15 s, the video about 50 s
+  behind. Whisper then handles about twice as many channels
+  (docs/PERFORMANCE.md); for recordings rather than live viewing.
 - Referrer and user agent from `#EXTVLCOPT` / `http-referrer=` in the playlist
   are passed on.
 
@@ -139,7 +148,7 @@ on the LAN.
 |---|---|---|
 | `PORT` | 8095 | |
 | `PUBLIC_URL` | `http://localhost:PORT` | base URL written into the playlist |
-| `ASR_BACKEND` | `remote` if `ASR_URL` is set, else `none` | relay: `remote` (an ASR server over HTTP, below) or `none` (video without subtitles). asr_server.py: `mlx` (Apple Silicon) or `cuda` (NVIDIA, docs/NVIDIA.md) |
+| `ASR_BACKEND` | `remote` if `ASR_URL` is set, else `none` | relay: `remote` (an ASR server over HTTP, below) or `none` (video without subtitles). asr_server.py: `mlx` (Apple Silicon), `cuda` (NVIDIA, docs/NVIDIA.md) or `cpu` (no GPU, docs/CPU.md) |
 | `ASR_URL` | | the ASR server, e.g. `http://asr-host:8096` |
 | `ASR_TIMEOUT` | 15 | seconds per remote request |
 | `DELAY` | 20 | target lead (s) of output behind the source when re-anchoring |
@@ -149,7 +158,10 @@ on the LAN.
 | `HOLD_MIN_LEAD` | 15 | A sentence cut off at the end of a chunk waits for the next chunk while its cue is still this many seconds ahead of the output |
 | `STALL` | 60 | restart a session whose input delivers nothing for this long |
 | `MUSIC_CAPTION` | `[♪ music]` | caption for music without usable lyrics (empty = off) |
-| `ARCHIVE_DIR`, `ARCHIVE_MINUTES` | off, 60 | rolling archive of ASR chunks for debugging |
+| `ARCHIVE_DIR`, `ARCHIVE_MINUTES` | off, 60 | rolling archive of ASR chunks for debugging (with "Keep audio archive" in the web page) |
+| `MAX_ADHOC_SESSIONS` | 6 | stateless `/api/stream` streams at once |
+| `EPG_TRANSLATE` | 0 | 1: translate `/epg.xml` into English with NLLB on the relay's CPU; the model (1.4 GB) downloads by itself into `models/` next to `CHANNELS_FILE` (`NLLB_MODEL` to put it elsewhere) |
+| `LONG_DELAY` | 50 | video delay (s) of channels with long chunks |
 
 ## Speech coverage and the hallucination guard
 
@@ -190,17 +202,34 @@ Tools (run inside the image, see the scripts' headers):
 - `tools/coverage.py <wav>`: the share of speech time captioned, under the old
   and new policies.
 
-With `ARCHIVE_DIR` set, the relay keeps the last `ARCHIVE_MINUTES` of ASR chunks
+With `ARCHIVE_DIR` set and "Keep audio archive" ticked in the web page (off by
+default: it costs disk and CPU for every running channel), the relay keeps the last `ARCHIVE_MINUTES` of ASR chunks
 (WAV, plus JSON with the raw segments, speech ratio and drop reasons) under
 `ARCHIVE_DIR/<channel>/`. Use it to check a caption against the audio.
+
+## Tests
+
+```sh
+docker build -t captions-dvr-tests -f tests/Dockerfile .
+docker run --rm captions-dvr-tests                    # unit + source tests, about 8 min
+docker run --rm captions-dvr-tests python -m pytest -q tests/unit   # a few seconds
+```
+
+`tests/unit` covers the relay's pieces (URL checks, `/api/stream` parsing,
+start cards, cue timing, the guide translator's download, the HTTP
+endpoints). `tests/sources` runs the relay against synthetic H.264, MPEG-2
+and HEVC sources (live HLS and plain TS) and `tests/fake_asr.py`, a fake ASR
+server with error modes: start card, segments, PAT/PMT, timed cues, the ASR
+going down, a source dropping out.
 
 ## ASR HTTP contract
 
 The relay's `remote` backend sends each audio chunk (6 to 12 s) as one request.
 Any service that implements these two endpoints works. `relay/asr_server.py`
 implements them with `ASR_BACKEND=mlx` (mlx-whisper on Apple Silicon; see
-`mac/` and INSTALL.md) or `ASR_BACKEND=cuda` on an NVIDIA GPU (tested on an RTX 3060;
-docs/NVIDIA.md). The relay itself does no speech recognition.
+`mac/` and INSTALL.md), `ASR_BACKEND=cuda` on an NVIDIA GPU (tested on an RTX 3060;
+docs/NVIDIA.md) or `ASR_BACKEND=cpu` without a GPU (one or two channels;
+docs/CPU.md). The relay itself does no speech recognition.
 
 ### `POST /v1/translate?language=ko`
 
@@ -284,6 +313,12 @@ The installer does the following, and is safe to re-run to upgrade:
 - puts a venv in `/opt/captions-dvr/venv` (~210 MB) and the code in `/opt/captions-dvr/app`
 - copies config to `/etc/captions-dvr/`, keeping any existing files
 - installs and starts `captions-dvr.service`
+
+## Capacity
+
+How many channels one ASR server captions at once (an RTX 3060 and a Mac
+mini M4), recommended settings and the benchmark tool (`bench/`):
+docs/PERFORMANCE.md.
 
 ## Resource use (remux only, measured on a Docker host, i5-11400)
 
