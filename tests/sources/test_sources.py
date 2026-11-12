@@ -193,6 +193,8 @@ def check(name, segs, log):
     vtts = [segs[n][1] or "" for n in seqs]
     if not all(v.startswith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000") for v in vtts if v):
         bad.append("VTT without the timestamp map")
+    if switch and not any("starting..." in v for v in vtts[:switch]):
+        bad.append("no status cue (\"... starting...\") over the start card")
     cues = [v for v in vtts if "Chunk" in v]
     if not cues:
         bad.append("no cues from the fake ASR")

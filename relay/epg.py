@@ -249,6 +249,11 @@ def guide_language(ch, countries):
     return lang
 
 
+def non_latin(text):
+    """Whether text has a script text_language() tells by itself."""
+    return any(pat.search(text) for pat, _ in _SCRIPTS) or bool(_ARABIC.search(text))
+
+
 def text_language(text, hint):
     """Language of one guide string: by script, else the channel's hint for
     Latin-script languages (e.g. Turkish). None means leave it alone."""
@@ -340,7 +345,11 @@ class Translator:
                 continue
             for tag in ("title", "sub-title", "desc", "category"):
                 for orig in el.findall(tag):
-                    if not (orig.text or "").strip() or orig.get("lang") == "en":
+                    if not (orig.text or "").strip():
+                        continue
+                    # A guide's lang="en" holds for Latin text only: some
+                    # (CCTV-13's) label Chinese titles "en".
+                    if orig.get("lang") == "en" and not non_latin(orig.text):
                         continue
                     lang = text_language(orig.text, hint)
                     if lang and lang in self.codes and lang != "en":

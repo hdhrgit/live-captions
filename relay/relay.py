@@ -55,8 +55,12 @@ import slate
 DELAY = float(os.environ.get("DELAY", "20"))
 MIN_LEAD = float(os.environ.get("MIN_LEAD", "15"))
 # Output starts this long after the first packet: time for the first chunk's
-# captions (the slate card covers the wait), and extra ASR lead from the start.
-START_DELAY = float(os.environ.get("START_DELAY", "8"))
+# captions (the slate card covers the wait). HLS sources only: the input
+# starts DELAY back in the source's playlist and reads that backlog fast (the
+# first chunk's captions were ready 2 s after the source opened), so 8 s held
+# the picture and sound back for nothing. A plain TS source builds its whole
+# delay under the card (Session.input_loop).
+START_DELAY = float(os.environ.get("START_DELAY", "3"))
 # On tune, release this much of the output at once (out of START_DELAY), so
 # the player has a few seconds buffered when the real picture follows the
 # slate card; otherwise the first pieces arrive just in time and it stalls
@@ -93,10 +97,11 @@ STALL = float(os.environ.get("STALL", "60"))
 # WebVTT subtitles with 608 + 708 embedded as well, so keep both by default.
 CC_CENTER = os.environ.get("CC_CENTER", "nbtsp")
 VTT_CHARS = int(os.environ.get("VTT_CHARS", "42"))   # WebVTT line length (0 = no breaks)
-# Embed CEA-608/708 in the video as well as the WebVTT track. Off by default:
-# Channels shows the WebVTT subtitles without it, and EIA added a second
-# (left-aligned on tvOS) caption track.
-EIA_DEFAULT = os.environ.get("EIA", "0") == "1"
+# Embed CEA-608/708 in the video as well as the WebVTT track (H.264 sources).
+# On by default: the Channels app playing remotely drops WebVTT and only the
+# embedded 608 survives (tvOS draws it left-aligned). EIA=0 or the per-channel
+# "EIA CC" switch turns it off.
+EIA_DEFAULT = os.environ.get("EIA", "1") == "1"
 # Where the audio archive goes when the web page's "Keep audio archive" is on
 # (off by default: it costs CPU and disk for every running channel).
 ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", "")
@@ -777,12 +782,16 @@ class Session:
             t0 = time.monotonic()
             self.compare(audio, start, lang, task, r.get("mt") or mt, r)
             self.stats["compare_total_s"] = round(el + time.monotonic() - t0, 2)
+        detecting = self.ch.language == "auto" and self.language is None
         if not kept and MUSIC_CAPTION and (ratio is None or ratio < 0.5) and asr.loud(audio):
             # Not bars or silence (gated above) and no usable words: music.
             # (Music doesn't count toward language detection: detect() needs speech.)
-            self.emit(start, start + len(audio) * TICKS // SR, MUSIC_CAPTION, log_it=False)
+            self.emit(start, start + len(audio) * TICKS // SR,
+                      MUSIC_CAPTION + (" - detecting language..." if detecting else ""), log_it=False)
             self.drop("music_caption")
             rec["music_caption"] = True
+        elif not kept and detecting:
+            self.emit(start, start + len(audio) * TICKS // SR, "detecting language...", log_it=False)
 
     def archive(self, audio, rec):
         """Keep the chunk's audio and ASR record for ARCHIVE_MINUTES (debugging)."""
@@ -1590,7 +1599,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "languages": languages.data,
                                    "health": {"running": checker.running, "progress": checker.progress},
                                    "epg": guide.matches, "epg_updated": guide.updated,
-                                   "whisper_langs": sorted(asr.WHISPER_LANGS)}).encode()
+                                   "whisper_langs": sorted(asr.WHISPER_LANGS), "eia_default": EIA_DEFAULT}).encode()
             return self.reply(200, "application/json", body)
         if path in ("", "index.html"):
             return self.reply(200, "text/html; charset=utf-8", UI)

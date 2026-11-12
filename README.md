@@ -5,9 +5,10 @@ machine-translated English subtitles, for Channels DVR. The relay pulls each
 channel's stream, translates the speech to English with SeamlessM4T v2 on
 the Mac (English channels: Whisper transcription), and serves it to Channels
 as **HLS with a WebVTT English subtitle track**, which Channels passes through to its clients
-and keeps in recordings. Optionally (per channel "EIA CC", or `EIA=1`
-for all) the same captions are also embedded in the video as CEA-608 and
-CEA-708 (A/53 SEI); Channels doesn't need them. The video is never re-encoded.
+and keeps in recordings. The same captions are also embedded in H.264 video
+as CEA-608 and CEA-708 (A/53 SEI), for clients that drop WebVTT (the Channels
+app playing remotely); per channel "EIA CC" off, or `EIA=0` for all, leaves
+them out. MPEG-2 and HEVC sources get WebVTT only. The video is never re-encoded.
 
 ```
 source ──► relay ─┬─ video/audio ── delay ~20 s ── (+ 608/708 SEI) ──► HLS /hls/<id>/ (TS segments + WebVTT)

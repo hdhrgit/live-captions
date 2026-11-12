@@ -2,7 +2,7 @@
 
 A cold channel needs 6-15 s before its first real HLS segment exists
 (opening the source, then a whole keyframe interval). Meanwhile the
-segmenter serves 2 s segments of a generic dark card with silent audio, so
+segmenter serves 2 s segments of a generic card (logo, spinner) with silent audio, so
 the DVR's first playlist request already has segments; the channel's name
 goes in a subtitle cue over it.
 
@@ -12,6 +12,7 @@ SLATE_SECONDS of 2 s segments, timestamps from 0, which is below where the
 relay's timeline starts (relay.Timeline), so the real stream continues
 forward after it.
 """
+import functools
 import io
 import json
 import logging
@@ -33,19 +34,21 @@ log = logging.getLogger("slate")
 SEG = 2.0                 # seconds per slate segment
 SLATE_SECONDS = 50        # cached length; enough for a slow source to start (below the 60 s timeline start)
 QUICK_SECONDS = 4         # quick() renders this much first (two segments)
+STILL_SECONDS = 20        # then this much more of the still card, until the full one is ready
 CACHE_DIR = os.environ.get("SLATE_DIR", "")
 DEFAULT = {"width": 1920, "height": 1080, "fps": 25, "sample_rate": 48000, "channels": 2, "profile": "High",
            "vcodec": "h264", "acodec": "aac"}
 _lock = threading.Lock()
 _mem = {}
 _rendering = set()
+_still = {}               # key -> a longer still card (quick()), until the full one is cached
 
 
 def _key(fmt):
     return "slate-{width}x{height}-{fps}-{sample_rate}-{channels}-{p}{c}".format(
         p=re.sub(r"\W", "", fmt.get("profile") or "High").lower(),
         c="" if (fmt.get("vcodec"), fmt.get("acodec")) == ("h264", "aac") else f"-{fmt.get('vcodec')}-{fmt.get('acodec')}",
-        **fmt) + ("-ntsc" if fmt.get("vcodec") == "mpeg2video" else "")   # (cards before 29.97 had none)
+        **fmt) + ("-ntsc" if fmt.get("vcodec") == "mpeg2video" else "") + "-v2"   # (-ntsc: cards before 29.97 had none; -v2: the spinner card)
 
 
 def _formats_path():
@@ -187,18 +190,83 @@ def quick(fmt):
     first tune of a new format doesn't leave the player without segments.
     run_slate moves on to the full card when the quick one runs out."""
     threading.Thread(target=segments, args=(fmt,), name="slate", daemon=True).start()
-    return render(fmt, QUICK_SECONDS)
+    threading.Thread(target=_render_still, args=(fmt,), name="slate-still", daemon=True).start()
+    return render(fmt, QUICK_SECONDS, still=True)
 
 
-def render(fmt, seconds=None):
-    w, h, fps = fmt["width"] // 2 * 2, fmt["height"] // 2 * 2, int(round(fmt["fps"])) or 25
-    img = Image.new("RGB", (w, h), (18, 20, 28))
+def _render_still(fmt):
+    """STILL_SECONDS of the still card (a few seconds' work, the full card
+    takes over 10 at 1080), so a first tune of a new format keeps getting
+    card segments until its first real one."""
+    key = _key(fmt)
+    if key not in _still and _cached(key) is None:
+        _still[key] = render(fmt, STILL_SECONDS, still=True)
+
+
+def more(fmt):
+    """The card to go on with after the quick one: the full one, else the longer still one."""
+    key = _key(fmt)
+    full = _cached(key)
+    if full:
+        _still.pop(key, None)
+        return full
+    return _still.get(key)
+
+
+BG, TRACK, VIOLET, MINT = (8, 8, 12), (48, 50, 62), (124, 108, 240), (94, 234, 190)
+
+
+@functools.lru_cache(maxsize=4)
+def card(w, h, loop):
+    """The card's picture: (background, [spinner patch per frame], patch
+    position). Background: the logo (a screen with two caption lines) in the
+    middle of a ring, the name and "captions starting..." below. The ring's
+    two arcs turn once per loop (a segment's frames), so every segment is the
+    same picture sequence and the cut between them doesn't show. Cached:
+    formats of the same size and rate share it."""
+    u = h / 1080
+    r, ring = round(120 * u), max(2, round(7 * u))
+    cx, cy = w // 2, round(h * 0.40)
+    img = Image.new("RGB", (w, h), BG)
+    # The logo, drawn 4x and scaled down for smooth edges.
+    k, lw, lh = 4, round(140 * u), round(100 * u)
+    logo = Image.new("RGB", (lw * k, lh * k), BG)
+    d = ImageDraw.Draw(logo)
+    d.rounded_rectangle((0, 0, lw * k - 1, lh * k - 1), radius=14 * u * k, fill=VIOLET)
+    for i, (x0, x1, colour) in enumerate(((0.18, 0.82, (245, 245, 250)), (0.30, 0.70, MINT))):
+        y0 = lh * k * (0.50 + 0.20 * i)
+        d.rounded_rectangle((lw * k * x0, y0, lw * k * x1, y0 + lh * k * 0.11), radius=lh * k * 0.055, fill=colour)
+    img.paste(logo.resize((lw, lh), Image.LANCZOS), (cx - lw // 2, cy - lh // 2))
     d = ImageDraw.Draw(img)
-    big, small = burn.font(max(16, h * 64 // 1080)), burn.font(max(12, h * 32 // 1080))
-    for text, f, y, colour in (("captions-dvr", big, 0.42, (235, 235, 235)),
-                               ("captions starting...", small, 0.56, (150, 160, 175))):
+    big, small = burn.font(max(16, round(64 * u))), burn.font(max(12, round(32 * u)))
+    for text, f, y, colour in (("captions-dvr", big, 0.58, (245, 245, 250)),
+                               ("captions starting...", small, 0.67, (150, 165, 190))):
         d.text(((w - f.getlength(text)) / 2, h * y), text, font=f, fill=colour)
-    frame_img = np.asarray(img)
+    background = np.array(img)
+    # The ring: a square patch around it, one per frame of the loop.
+    side = 2 * (r + ring) + 4
+    x, y = cx - side // 2, cy - side // 2
+    under = Image.fromarray(background[y:y + side, x:x + side]).convert("RGBA")
+    k = 2   # (4x like the logo took over a second per 1080 card)
+    box = (2 * k, 2 * k, (side - 2) * k, (side - 2) * k)
+    spinner = []
+    for i in range(max(1, loop)):
+        a = 360 * i / max(1, loop) - 90
+        layer = Image.new("RGBA", (side * k, side * k), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        d.ellipse(box, outline=TRACK, width=ring * k)
+        d.arc(box, a, a + 75, fill=VIOLET, width=ring * k)
+        d.arc(box, a + 180, a + 220, fill=MINT, width=ring * k)
+        patch = Image.alpha_composite(under, layer.resize((side, side), Image.LANCZOS))
+        spinner.append(np.asarray(patch.convert("RGB")))
+    return background, spinner, (x, y)
+
+
+def render(fmt, seconds=None, still=False):
+    """still: the ring doesn't turn (quick(): a turning one is slower to draw
+    and encode, which delayed a cold MPEG-2 1080i start past 5 s)."""
+    w, h, fps = fmt["width"] // 2 * 2, fmt["height"] // 2 * 2, int(round(fmt["fps"])) or 25
+    background, spinner, (x, y) = card(w, h, 1 if still else int(fps * SEG))
 
     buf = io.BytesIO()
     out = av.open(buf, mode="w", format="mpegts")
@@ -230,6 +298,9 @@ def render(fmt, seconds=None):
     samples = 0
     vrate = float(v.codec_context.framerate or fps)
     for i in range(int((seconds or SLATE_SECONDS) * vrate)):
+        frame_img = background.copy()
+        patch = spinner[i % len(spinner)]
+        frame_img[y:y + patch.shape[0], x:x + patch.shape[1]] = patch
         vf = av.VideoFrame.from_ndarray(frame_img, format="rgb24").reformat(format="yuv420p")
         vf.pts = i
         for p in v.encode(vf):

@@ -142,9 +142,11 @@ In Settings > Sources > Add Source > Custom Channels:
 
 Pick channels in the relay's web page (http://dvr-host:8095/, "Sources &
 channels"); Channels picks them up on its next source refresh. In the Channels
-player choose the **English subtitles** track. (CEA-608/708 CC embedding is
-off by default; turn on "EIA CC" per channel if a client needs it. Channels
-whose source has its own English captions pass those through as CC.) Subtitles start about 15 s after tuning, run
+player choose the **English subtitles** track. (The same captions are also
+embedded as CEA-608/708 CC in H.264 video, for clients that drop WebVTT, such
+as the Channels app playing remotely; turn off "EIA CC" per channel, or set
+`EIA=0` for all, to leave them out. Channels whose source has its own English
+captions pass those through as CC.) Subtitles start about 15 s after tuning, run
 about 20–30 s behind the live source, and are kept in recordings.
 
 Use only one captions-dvr source. (`/playlist-hls.m3u`, the older name, is

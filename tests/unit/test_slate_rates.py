@@ -38,4 +38,13 @@ def test_1080_mpeg2_card_is_interlaced(monkeypatch):
 def test_card_key_changes_with_format():
     a = slate._key(dict(BASE, fps=25, vcodec="mpeg2video", acodec="ac3"))
     b = slate._key(dict(BASE, fps=30, vcodec="mpeg2video", acodec="ac3"))
-    assert a != b and a.endswith("-ntsc")
+    assert a != b and "-ntsc" in a and a.endswith("-v2")
+
+
+def test_spinner_turns_once_per_segment():
+    """The ring moves from frame to frame and comes round to the start each
+    segment (the cut between two card segments doesn't show)."""
+    background, spinner, (x, y) = slate.card(640, 360, 50)
+    assert len(spinner) == 50
+    assert (spinner[0] != spinner[1]).any() and (spinner[0] != spinner[25]).any()
+    assert spinner[0].shape[0] + y <= 360 and spinner[0].shape[1] + x <= 640

@@ -37,7 +37,7 @@ TABLE_PIDS = (0x0000, 0x1000)   # PAT, and the PMT where libavformat's muxer put
 MUX_DELAY = 63000
 # WebVTT cue line per caption position setting.
 VTT_LINE = {"bottom": "85%", "middle": "65%", "top": "10%"}
-EIA_DEFAULT = os.environ.get("EIA", "0") == "1"   # as in relay.py
+EIA_DEFAULT = os.environ.get("EIA", "1") == "1"   # as in relay.py
 BACKEND = None   # the relay's ASR backend (set by relay.main); its .mts says which tracks exist
 COUNTRIES = None      # set by relay.main: channel cfg -> countries
 COUNTRY_LANG = None   # set by relay.main: (cfg, countries) -> likely spoken language
@@ -137,28 +137,45 @@ class Segmenter:
             with self.lock:
                 self.slate_on = False
             return
+        s = self.ch.session
+        lang = getattr(s, "language", None) or (self.ch.cfg.get("language") or "auto")
+        what = (f"{LABELS.get(main_mt(self.ch.cfg), '')} subtitles, {LANG_NAMES.get(lang, lang)}"
+                if lang != "auto" else "detecting language")
+        name = f"{self.ch.name} - " if self.ch.name else ""
         t0 = time.monotonic()
         k = 0
         while True:
             if k >= len(segs):
-                # A quick card ran out: go on with the full one, in the same
-                # format (same picture and timestamps), once it's rendered.
+                # A quick card ran out: go on with the longer still one or
+                # the full one, in the same format (same timestamps), once
+                # one that goes further is rendered.
                 fmt, more = slate.fmt_of(self.ch), None
                 for _ in range(int(2 * slate.SEG / 0.25)):
-                    more = slate._cached(slate._key(fmt)) if fmt else None
-                    if more or not self.slate_on:
+                    more = slate.more(fmt) if fmt else None
+                    if (more and len(more) > k) or not self.slate_on:
                         break
                     time.sleep(0.25)
                 if not more or len(more) <= k:
                     return
                 segs = more
             dur, data, pts = segs[k]
+            # A source that fails to open says so on the card (e.g. a tuner
+            # that answers 503: all its tuners are busy) instead of "starting".
+            err = str(((getattr(self.ch.session, "stats", None) or {}).get("input") or ""))
+            text = name + (f"{what} - starting..." if not err.startswith("error") else
+                           "no free tuner, retrying..." if "503" in err or "5XX" in err else
+                           "source not answering, retrying...")
             with self.lock:
                 if not self.slate_on:
                     return
                 self.segments.append((self.seq, pts, dur, data))
                 self.seq += 1
                 self.ch.hls_next_seq = self.seq
+                # In time order: the first captions (from 60 s on the
+                # timeline) can be in before a new format's card is rendered.
+                cues, cs = self.ch.vtt_tracks.get("main"), pts - MUX_DELAY
+                if cues is not None and all(c[0] != cs for c in cues):
+                    cues.insert(sum(c[0] < cs for c in cues), (cs, cs + int(dur * 90000), text))
             if k >= 1:
                 time.sleep(max(0.0, t0 + (k * dur) - time.monotonic()))
             k += 1
@@ -259,9 +276,12 @@ class Segmenter:
         keeps only one subtitle rendition, so comparison channels each get
         their own master with a different track."""
         s = self.ch.session
-        # Declare CC1 when we embed 608, or when the source's own captions
-        # are passed through (e.g. US news channels in "CC: auto").
-        eia = self.ch.cfg.get("eia", EIA_DEFAULT) or bool(s and s.use_source_cc)
+        # Declare CC1 when we embed 608 (H.264 only: not for a source seen as
+        # MPEG-2 or HEVC), or when the source's own captions are passed
+        # through (e.g. US news channels in "CC: auto").
+        fmt = slate.fmt_of(self.ch)
+        h264 = fmt is None or fmt.get("vcodec", "h264") == "h264"
+        eia = (self.ch.cfg.get("eia", EIA_DEFAULT) and h264) or bool(s and s.use_source_cc)
         cc = ('#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="English CC",LANGUAGE="en",'
               'INSTREAM-ID="CC1",DEFAULT=NO,AUTOSELECT=NO\n') if eia else ""
         subs = ""

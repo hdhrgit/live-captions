@@ -91,6 +91,22 @@ def test_master_has_subtitles(relay):
     assert code == 200 and "TYPE=SUBTITLES" in body and "subs.m3u8" in body
 
 
+def test_608_on_by_default(relay):
+    """WebVTT and embedded 608 both by default (remote Channels clients drop
+    WebVTT); a channel's "eia": false or EIA=0 turns 608 off."""
+    off = json.loads(json.dumps(CHANNELS))
+    off["channels"].append(dict(off["channels"][0], id="t2", number=9002, eia=False))
+    base, _, _ = relay(off)
+    assert 'CLOSED-CAPTIONS="cc"' in get(base + "/hls/t1/master.m3u8")[1]
+    assert 'CLOSED-CAPTIONS=NONE' in get(base + "/hls/t2/master.m3u8")[1]
+    assert json.loads(get(base + "/api/config")[1])["eia_default"] is True
+
+
+def test_608_off_with_eia_0(relay):
+    base, _, _ = relay(CHANNELS, EIA="0")
+    assert 'CLOSED-CAPTIONS=NONE' in get(base + "/hls/t1/master.m3u8")[1]
+
+
 def test_status_has_version_and_problems(relay):
     base, _, _ = relay()
     st = json.loads(get(base + "/status")[1])

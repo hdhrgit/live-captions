@@ -94,3 +94,26 @@ def test_fetch_resumes_and_checks(monkeypatch, tmp_path):
     monkeypatch.setattr(nllbget.urllib.request, "urlopen", lambda req, timeout: Resp(req))
     nllbget.fetch(str(tmp_path))
     assert seen["range"] == "bytes=400-" and (tmp_path / "f.bin").read_bytes() == data
+
+
+def test_chinese_labelled_english_is_translated(tmp_path):
+    """A guide's lang="en" on Chinese text (CCTV-13's) doesn't stop the
+    translation; English and Latin text labelled "en" stay as they are."""
+    import sqlite3
+    import xml.etree.ElementTree as ET
+
+    class MT:
+        def translate(self, texts, lang):
+            return [f"[{lang}] {t}" for t in texts]
+
+    tr = epg.Translator()
+    tr.mt, tr.codes = MT(), {"zh": "zho_Hans"}
+    tr.db = sqlite3.connect(str(tmp_path / "tr.db"))
+    tr.db.execute("CREATE TABLE tr2 (lang TEXT, src TEXT, en TEXT, PRIMARY KEY (lang, src))")
+    tr._ready = lambda: True
+    progs = [ET.fromstring('<programme channel="c13"><title lang="en">新聞直播間</title></programme>'),
+             ET.fromstring('<programme channel="c1"><title lang="en">Network News</title></programme>')]
+    assert tr.translate_programmes(progs, {"c13": "zh", "c1": "zh"}) == 1
+    assert progs[0].find("title").text == "[zh] 新聞直播間"
+    assert progs[0].find("desc").text == "Original title: 新聞直播間"
+    assert progs[1].find("title").text == "Network News"
