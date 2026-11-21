@@ -233,6 +233,7 @@ class Config:
                        "url": url}
                 self.sources.append(src)
             src["updated"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+            self.follow_moved(src["id"], entries)
             known = {c["url"]: c for c in self.channels}
             added = 0
             for e in entries:
@@ -256,6 +257,21 @@ class Config:
             src["majors"] = sum(1 for c in self.channels if c["source"] == src["id"] and c["major"])
             self.save()
             return src, added
+
+    def follow_moved(self, sid, entries):
+        """An enabled channel whose URL is gone from its source's list takes
+        the listed URL of the same tvg-id (the name decides between several),
+        keeping its number, name and options. Not one whose URL was set by hand."""
+        urls = {e["url"] for e in entries}
+        for c in self.channels:
+            tid = (c.get("tvg") or {}).get("tvg-id")
+            if c["source"] != sid or not c.get("enabled") or c.get("url_manual") or c["url"] in urls or not tid:
+                continue
+            same = [e for e in entries if e["tvg"].get("tvg-id") == tid]
+            if same:
+                e = next((e for e in same if e["name"] == c["name"]), same[0])
+                c["url"] = e["url"]
+                c.pop("health", None)
 
     def remove_source(self, sid):
         """Drops the source and its channels that are not enabled."""
@@ -296,6 +312,13 @@ class Config:
             c = self.get(cid)
             if c is None:
                 raise KeyError(cid)
+            if "url" in changes:
+                url = str(changes["url"]).strip()
+                if not re.match(r"https?://[^/\s]+", url):
+                    raise ValueError("url must be an http(s) URL")
+                # Set by hand: a source refresh leaves it alone (follow_moved).
+                c["url"], c["url_manual"] = url, True
+                c.pop("health", None)
             if "enabled" in changes:
                 c["enabled"] = bool(changes["enabled"])
                 if c["enabled"] and not c.get("number"):

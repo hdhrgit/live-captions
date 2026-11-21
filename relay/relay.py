@@ -72,6 +72,13 @@ BURST = float(os.environ.get("BURST", "0"))
 # bundled; set it here or in the web page ("Audio ffmpeg"), which wins.
 AC4_FFMPEG = os.environ.get("AC4_FFMPEG", "")
 COLD_WAIT = float(os.environ.get("COLD_WAIT", "8"))   # max hold of a playlist request with no segments yet
+# A source that has delivered nothing for this long while failing (after the
+# start card, ~50 s): the channel's playlists answer 503, so Channels DVR tunes
+# its alternate channel instead of recording the card and retrying.
+DEAD_SOURCE_TIMEOUT = float(os.environ.get("DEAD_SOURCE_TIMEOUT", "60"))
+# The playlist request re-reads the source lists (moved stream URLs are
+# followed, config.follow_moved), at most this often (s).
+SOURCE_REFRESH = float(os.environ.get("SOURCE_REFRESH", "600"))
 GRACE = float(os.environ.get("GRACE", "60"))
 PORT = int(os.environ.get("PORT", "8095"))
 PUBLIC_URL = os.environ.get("PUBLIC_URL", f"http://localhost:{PORT}")
@@ -1300,6 +1307,7 @@ def nllb_missing():
     """EPG_TRANSLATE=1 and no model: download it once, in the background."""
     nllb_download.start(guide.wake.set)   # (no-op while one runs)
 guide = epg.Guide()
+adhoc_guides = epg.AdhocGuides(guide.translator)
 checker = None   # health.Checker, started in main()
 channels = {}    # id -> Channel, created on first use
 
@@ -1551,6 +1559,62 @@ def asr_health():
     return _health["value"]
 
 
+dead_sources = set()   # front: channels whose worker reported a dead source
+_refreshed = {}        # source id -> monotonic time of its last refresh
+
+
+def source_dead(ch):
+    """Worker: the session's input has been failing and has delivered nothing
+    for DEAD_SOURCE_TIMEOUT (the start card covers ~50 s of that)."""
+    s = ch.session
+    return (s is not None and str(s.stats.get("input") or "").startswith("error")
+            and time.monotonic() - s.last_input > DEAD_SOURCE_TIMEOUT)
+
+
+def source_reachable(ch):
+    """Front: whether one of the channel's HLS feeds loads (its playlist).
+    Other sources (e.g. a tuner's TS stream) aren't opened just to check."""
+    headers = ch.cfg.get("headers") or {}
+    h = {"User-Agent": headers.get("user_agent") or "Mozilla/5.0"}
+    if headers.get("referer"):
+        h["Referer"] = headers["referer"]
+    for url in ch.urls():
+        if ".m3u" not in url.split("?")[0]:
+            return True
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=5) as r:
+                r.read(1)
+            return True
+        except Exception:  # noqa: BLE001 - HTTP error, timeout, unreachable: the next feed
+            continue
+    return False
+
+
+def refresh_sources():
+    """Re-read the lists of sources with enabled channels (the DVR fetching
+    the playlist, e.g. its daily refresh), so channels whose stream moved
+    follow it. Each in its own thread, up to 20 s in all; a list that
+    doesn't load keeps the stored copy."""
+    with config.lock:
+        sids = {c["source"] for c in cfg.enabled()}
+        todo = [s for s in cfg.sources if s["id"] in sids and s.get("url")
+                and time.monotonic() - _refreshed.get(s["id"], -SOURCE_REFRESH) >= SOURCE_REFRESH]
+    for s in todo:
+        _refreshed[s["id"]] = time.monotonic()
+
+    def one(src):
+        try:
+            cfg.add_source(src["url"], src.get("name"))
+        except Exception as e:  # noqa: BLE001 - keep the stored copy
+            log.warning("source %s not refreshed: %s", src["id"], e)
+    threads = [threading.Thread(target=one, args=(s,), name="source-refresh", daemon=True) for s in todo]
+    for t in threads:
+        t.start()
+    end = time.monotonic() + 20
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
@@ -1568,9 +1632,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.hls(path)
         if path in ("api/stream", "api/m3u"):
             return self.adhoc(path)
+        if path == "api/epg":
+            return self.adhoc_epg()
         if path in ("playlist.m3u", "playlist.m3u8", "playlist-hls.m3u"):
             # The enabled channels as HLS with a WebVTT English subtitle track
             # (Channels DVR: Stream Format HLS). playlist-hls.m3u: its old name.
+            refresh_sources()
             body = f'#EXTM3U url-tvg="{PUBLIC_URL}/epg.xml" x-tvg-url="{PUBLIC_URL}/epg.xml"\n'
             for c in cfg.enabled():
                 tvg = c.get("tvg", {})
@@ -1642,12 +1709,42 @@ class Handler(BaseHTTPRequestHandler):
         # The worker maps the backend to its subtitle track (Handler.hls).
         return self.proxy(cid, f"/hls/{cid}/master-{mt}.m3u8" if mt else f"/hls/{cid}/master.m3u8")
 
+    def adhoc_epg(self):
+        """Stateless mode: /api/epg?url= serves an XMLTV guide translated to
+        English (lang= hints the language of channels whose strings carry no
+        lang attribute; non-Latin scripts are recognised anyway)."""
+        q = adhoc.parse_query(self.path.partition("?")[2])
+        url = (q.get("url") or [""])[0]
+        try:
+            if not url:
+                raise adhoc.Refused("missing url= parameter (the XMLTV guide, URL-encoded)")
+            adhoc.allowed(url)
+            if not epg.TRANSLATE():
+                raise adhoc.Refused("guide translation is off (EPG_TRANSLATE=1)", 503)
+            body = adhoc_guides.get(url, (q.get("lang") or [""])[0])
+        except adhoc.Refused as e:
+            return self.reply(e.code, "text/plain", f"{e}\n".encode())
+        except Exception as e:  # noqa: BLE001
+            return self.reply(502, "text/plain", f"guide not reachable: {type(e).__name__}: {e}\n".encode())
+        return self.reply(200, "application/xml; charset=utf-8", body)
+
     def hls(self, path):
         _, cid, name = (path.split("/") + ["", ""])[:3]
         ch = channel(cid)
         if ch is None:
             return self.reply(404, "text/plain", b"no such channel\n")
         if not WORKER:
+            # A cold tune (or one after the worker reported a dead source)
+            # of a source that doesn't answer fails at once: Channels DVR
+            # tunes a recording's alternate channel only when the first tune
+            # fails; once it has recorded from a channel (the start card
+            # included) it retries that one only.
+            w = workers.get(cid)
+            if name.endswith(".m3u8") and (cid in dead_sources or not (w and w.alive())):
+                if not source_reachable(ch):
+                    log.warning("%s: no feed answers, playlist answers 503", cid)
+                    return self.reply(503, "text/plain", b"source not answering\n")
+                dead_sources.discard(cid)
             return self.proxy(cid, "/" + path)
         if ch.cfg.get("adhoc"):
             # A backend variant's URL (e.g. after a relay restart): register
@@ -1657,6 +1754,14 @@ class Handler(BaseHTTPRequestHandler):
                 track = adhoc.want(ch.cfg, m.group(2))
                 name = (m.group(1) + track + m.group(3)) if track != "main" else \
                     {"master-": "master", "subs-": "subs"}.get(m.group(1), m.group(1)[:-1]) + m.group(3)
+        if name.endswith(".m3u8") and source_dead(ch):
+            log.warning("%s: source dead for %.0fs (%s): playlist answers 503", cid, DEAD_SOURCE_TIMEOUT,
+                        ch.session.stats.get("input"))
+            self.send_response(503)
+            self.send_header("X-Source-Dead", "1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if ch.hls is None:
             ch.hls = hls.Segmenter(ch)
         seg = ch.hls
@@ -1703,6 +1808,8 @@ class Handler(BaseHTTPRequestHandler):
             conn, r = worker(cid).request("GET", path, timeout=90)
         except (OSError, RuntimeError, http.client.HTTPException) as e:
             return self.reply(502, "text/plain", f"channel worker: {e}\n".encode())
+        if r.status == 503 and r.getheader("X-Source-Dead"):
+            dead_sources.add(cid)
         try:
             self.send_response(r.status)
             for k, v in r.getheaders():
@@ -1764,7 +1871,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "text/vtt"
         elif path in ("", "index.html"):
             ctype = "text/html; charset=utf-8"
-        elif path in ("epg.xml",):
+        elif path in ("epg.xml", "api/epg"):
             ctype = "application/xml; charset=utf-8"
         else:
             ctype = "application/json"

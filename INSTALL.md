@@ -128,6 +128,8 @@ NLLB-200 on its own CPU (cached, so only new programmes cost time). Set
 first time it downloads the model (1.4 GB, CC-BY-NC) into
 `/var/lib/captions-dvr/models` by itself. To fetch it beforehand:
 `sudo captions-dvr-get-nllb`. Off by default; captions don't need it.
+While it translates new programmes the relay uses about 3 GB of RAM more;
+the model is unloaded a minute after (`EPG_NLLB_KEEP`).
 
 ## 3. Channels DVR
 

@@ -146,18 +146,24 @@ ATSC = [dict(DEFAULT, width=w, height=h, fps=f, channels=c, profile="Main", vcod
 
 def prepare():
     """Render the 1080p card, common broadcast ones and those of all source
-    formats seen before (startup)."""
-    segments(DEFAULT)
-    for fmt in ATSC:
-        segments(fmt)
-    for fmt in {json.dumps(f, sort_keys=True) for f in _formats().values()}:
-        segments(dict(DEFAULT, **json.loads(fmt)))
+    formats seen before (startup, front process). Only into the disk cache:
+    the channel workers serve the cards and each loads the one it needs."""
+    for fmt in [DEFAULT] + ATSC + [dict(DEFAULT, **json.loads(f))
+                                    for f in {json.dumps(f, sort_keys=True) for f in _formats().values()}]:
+        segments(fmt, keep=False)
+    card.cache_clear()
 
 
-def segments(fmt):
-    """[(duration, ts_bytes, start_pts)] of the slate in this format, rendering it if needed."""
+def segments(fmt, keep=True):
+    """[(duration, ts_bytes, start_pts)] of the slate in this format, rendering
+    it if needed. keep=False: a card already on disk isn't read, and a new one
+    is only written there (None is returned)."""
     key = _key(fmt)
-    segs = _cached(key)
+    path = os.path.join(CACHE_DIR, key + ".json") if CACHE_DIR else None
+    keep = keep or not path
+    if not keep and os.path.exists(path) and os.path.exists(path[:-5] + ".ts"):
+        return None
+    segs = _cached(key) if keep else None
     if segs is not None:
         return segs
     with _lock:
@@ -171,9 +177,9 @@ def segments(fmt):
         with _lock:
             _rendering.discard(key)
     log.info("rendered slate %s (%d segments)", key, len(segs))
-    path = os.path.join(CACHE_DIR, key + ".json") if CACHE_DIR else None
     with _lock:
-        _mem[key] = segs
+        if keep:
+            _mem[key] = segs
         if path:
             try:
                 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -181,7 +187,7 @@ def segments(fmt):
                 _write(path, json.dumps([(d, len(s), p) for d, s, p in segs]).encode())
             except OSError as e:
                 log.warning("can't cache slate: %s", e)
-        return segs
+        return segs if keep else None
 
 
 def quick(fmt):

@@ -29,9 +29,50 @@ def test_model_appearing_later_is_used(monkeypatch, tmp_path):
     assert t._ready() is False
     path.mkdir()
     (path / "model.bin").write_bytes(b"x")
-    monkeypatch.setattr("asr.NLLB", lambda p, threads: "loaded")
+    monkeypatch.setattr("asr.NLLB", lambda p, threads: Model())
     monkeypatch.setattr(epg, "CACHE", str(tmp_path / "cache.sqlite"))
-    assert t._ready() is True and t.mt == "loaded"
+    monkeypatch.setattr(epg, "NLLB_KEEP", 3600)
+    assert t._ready() is True and t.mt is None   # loaded only for new strings
+    assert t._load() is True and isinstance(t.mt, Model)
+
+
+class Model:
+    """A stand-in for asr.NLLB."""
+    closed = False
+
+    def translate(self, texts, lang):
+        return [f"[{lang}] {t}" for t in texts]
+
+    def close(self):
+        self.closed = True
+
+
+def test_model_loaded_for_new_strings_only_and_unloaded(monkeypatch, tmp_path):
+    """Strings in the cache don't load the model; new ones do, and it is
+    unloaded EPG_NLLB_KEEP after the job (freeing about 1.4 GB)."""
+    import time
+    import xml.etree.ElementTree as ET
+    path = tmp_path / "m"
+    path.mkdir()
+    (path / "model.bin").write_bytes(b"x")
+    monkeypatch.setenv("NLLB_MODEL", str(path))
+    monkeypatch.setattr(epg, "CACHE", str(tmp_path / "cache.sqlite"))
+    loads = []
+    monkeypatch.setattr("asr.NLLB", lambda p, threads: loads.append(Model()) or loads[-1])
+    monkeypatch.setattr(epg, "NLLB_KEEP", 0.5)
+    t = epg.Translator()
+
+    def progs():
+        return [ET.fromstring('<programme channel="c"><title>新聞直播間</title></programme>')]
+    assert t.translate_programmes(progs(), {"c": "zh"}) == 1 and len(loads) == 1
+    for _ in range(40):
+        if t.mt is None:
+            break
+        time.sleep(0.1)
+    assert t.mt is None and loads[0].closed
+    p = progs()
+    assert t.translate_programmes(p, {"c": "zh"}) == 0 and len(loads) == 1   # from the cache
+    assert p[0].find("title").text == "[zh] 新聞直播間"
 
 
 def test_download_retries_then_ready(monkeypatch, tmp_path, caplog):
@@ -117,3 +158,57 @@ def test_chinese_labelled_english_is_translated(tmp_path):
     assert progs[0].find("title").text == "[zh] 新聞直播間"
     assert progs[0].find("desc").text == "Original title: 新聞直播間"
     assert progs[1].find("title").text == "Network News"
+
+
+class FakeTranslator:
+    """Records what would be translated, per channel hint."""
+
+    def __init__(self):
+        self.seen = []
+
+    def translate_programmes(self, elements, langs):
+        for el in elements:
+            for e in el.findall("title"):
+                self.seen.append((el.get("channel"), langs.get(el.get("channel")), e.get("lang"), e.text))
+            el.find("title").text = "EN " + el.find("title").text
+        return len(elements)
+
+
+def test_stateless_guide_languages():
+    """/api/epg: lang attributes give each channel's language; "en"-labelled
+    German is relabelled; Devanagari is recognised; English stays English."""
+    xml = ('<tv><programme channel="a"><title lang="es">Noticias RCN</title></programme>'
+           '<programme channel="b"><title lang="en">Der Tatort mit dem Kommissar und die Spur</title></programme>'
+           '<programme channel="c"><title lang="en">आज तक की खबरें</title></programme>'
+           '<programme channel="d"><title lang="en">The evening news with the anchor</title></programme></tv>')
+    t = FakeTranslator()
+    out, n = epg.translate_xmltv(xml.encode(), t)
+    langs = {ch: (hint, lang) for ch, hint, lang, _ in t.seen}
+    assert langs["a"] == ("es", "es")
+    assert langs["b"] == ("de", "de")
+    assert langs["c"][0] == "" and epg.text_language("आज तक की खबरें", "") == "hi"
+    assert langs["d"] == ("", "en")
+    assert n == 4 and b"EN Noticias RCN" in out and out.startswith(b"<?xml")
+
+
+def test_guess_latin():
+    assert epg.guess_latin("Les nouvelles du soir et la météo") == "fr"
+    assert epg.guess_latin("Il telegiornale della sera con le notizie") == "it"
+    assert epg.guess_latin("Tatort") is None
+
+
+def test_stateless_guide_refetched_after_ttl(monkeypatch):
+    """/api/epg: a copy older than EPG_ADHOC_MINUTES is fetched again (FAST
+    guides cover only hours ahead); a fresh one is served from the cache."""
+    import threading
+    fetched = []
+    g = epg.AdhocGuides(FakeTranslator())
+    monkeypatch.setattr(g, "_fetch", lambda url: fetched.append(url) or
+                        b'<tv><programme channel="a"><title lang="es">Hola amigos</title></programme></tv>')
+    monkeypatch.setattr(threading, "Thread", lambda target, args, daemon: type(
+        "T", (), {"start": lambda self: target(*args)})())
+    g.get("http://x/epg.xml")
+    assert b"EN Hola" in g.get("http://x/epg.xml") and len(fetched) == 1
+    g.cache[("http://x/epg.xml", "")]["at"] -= g.TTL + 1
+    g.get("http://x/epg.xml")
+    assert len(fetched) == 2

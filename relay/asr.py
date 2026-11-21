@@ -305,6 +305,11 @@ class NLLB:
         self.sp = sentencepiece.SentencePieceProcessor(
             model_file=os.path.join(path, "sentencepiece.bpe.model"))
 
+    def close(self):
+        """Free the model's memory now (the relay's guide translator)."""
+        self.tr.unload_model()
+        self.tr = None
+
     def translate(self, texts, src):
         idx = [i for i, t in enumerate(texts) if t.strip()]
         out = list(texts)

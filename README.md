@@ -50,6 +50,16 @@ list of channels works too (`examples/channels.example.json`):
 Optional per channel: `logo`, and `live_start_index` (how many segments back
 from the live edge to start, default `-(DELAY/6+1)`, which assumes 6 s segments).
 
+Streams that move or die: when Channels DVR fetches the playlist (its
+source refresh, daily by default), the relay re-reads the lists of its
+sources with enabled channels (at most every `SOURCE_REFRESH` seconds). An
+enabled channel whose URL is gone from its list takes the listed URL with
+the same tvg-id, keeping its number and settings; a URL typed into the web
+page stays as set. A tune of a channel whose HLS feeds all fail to load
+answers 503 at once, so a recording moves to its alternate channel (Channels
+DVR tries the alternates only when the first tune fails). A source that dies
+during a recording gets the start card, then 503 after `DEAD_SOURCE_TIMEOUT`.
+
 Translation (`mt`, set in the web page): `seamless` is the default when the
 Mac offers it (one GPU request per chunk, ~1.6 s for 6-12 s of audio, so a
 Mac M4 carries roughly 5-6 channels); `nllb` and `whisper` remain. Seamless
@@ -102,6 +112,7 @@ the relay, and the channel list, numbers and guide all stay with the DVR:
 |---|---|
 | `/api/m3u?url=<playlist>` | The playlist (cached 5 min) with every stream URL rewritten to `/api/stream`; `#EXTINF` attributes and names unchanged |
 | `/api/stream?url=<stream>` | One source as HLS with an English WebVTT track (the same output as managed channels). Starts on first request, shared by all viewers, stops when idle |
+| `/api/epg?url=<XMLTV>` | That guide translated to English with the relay's NLLB (`EPG_TRANSLATE=1`; each channel's language from its `lang` attributes, `lang=` for those without). The first request gets the original at once and starts the translation; later ones get the translated copy, re-fetched after `EPG_ADHOC_MINUTES` (60) |
 
 Parameters (both endpoints; `/api/m3u` passes them on):
 
@@ -158,10 +169,13 @@ on the LAN.
 | `CHUNK_MIN`, `CHUNK_MAX`, `PAUSE_MS` | 4, 15, 300 | ASR chunks end at the first speech pause of `PAUSE_MS` after `CHUNK_MIN` seconds, or at the quietest point at `CHUNK_MAX` (i24: 7.5 s on average) |
 | `HOLD_MIN_LEAD` | 15 | A sentence cut off at the end of a chunk waits for the next chunk while its cue is still this many seconds ahead of the output |
 | `STALL` | 60 | restart a session whose input delivers nothing for this long |
+| `DEAD_SOURCE_TIMEOUT` | 60 | seconds a failing source may deliver nothing (the start card covers ~50) before the channel's playlists answer 503 |
+| `SOURCE_REFRESH` | 600 | seconds between source list refreshes triggered by playlist requests |
 | `MUSIC_CAPTION` | `[♪ music]` | caption for music without usable lyrics (empty = off) |
 | `ARCHIVE_DIR`, `ARCHIVE_MINUTES` | off, 60 | rolling archive of ASR chunks for debugging (with "Keep audio archive" in the web page) |
 | `MAX_ADHOC_SESSIONS` | 6 | stateless `/api/stream` streams at once |
-| `EPG_TRANSLATE` | 0 | 1: translate `/epg.xml` into English with NLLB on the relay's CPU; the model (1.4 GB) downloads by itself into `models/` next to `CHANNELS_FILE` (`NLLB_MODEL` to put it elsewhere) |
+| `EPG_TRANSLATE` | 0 | 1: translate `/epg.xml` into English with NLLB on the relay's CPU; the model (1.4 GB) downloads by itself into `models/` next to `CHANNELS_FILE` (`NLLB_MODEL` to put it elsewhere). It is loaded only for programmes not translated before, takes about 3 GB of RAM while it translates, and is unloaded after a job |
+| `EPG_NLLB_KEEP` | 60 | seconds the guide translation model stays loaded after its last job |
 | `LONG_DELAY` | 50 | video delay (s) of channels with long chunks |
 
 ## Speech coverage and the hallucination guard

@@ -269,7 +269,8 @@ function renderChannels() {
   $("chtable").innerHTML = shown.map((c) => `<tr data-id="${esc(c.id)}">
       <td><input type="checkbox" data-f="enabled" ${c.enabled ? "checked" : ""}></td>
       <td><div class="name">${healthIcon(c.health)} ${c.major && c.source !== "manual" ? "★ " : ""}${esc(c.name)}</div><div class="sub">${esc((c.tvg || {})["group-title"] || "")} · ${esc(c.source)}${
-        c.enabled ? ((conf.epg || {})[c.id] ? ` · <span class="ok" title="${esc(conf.epg[c.id])}">guide ✓</span>` : " · no guide") : ""}</div></td>
+        c.enabled ? ((conf.epg || {})[c.id] ? ` · <span class="ok" title="${esc(conf.epg[c.id])}">guide ✓</span>` : " · no guide") : ""}</div>${
+        c.enabled ? `<input data-f="url" style="width:100%" value="${esc(c.url)}" title="Stream URL. Changed here, it is kept as set: a source refresh no longer moves it">` : ""}</td>
       <td class="n"><input data-f="number" inputmode="numeric" placeholder="#" value="${esc(c.number ?? "")}"></td>
       <td class="l"><input data-f="language" list="langs" value="${esc(c.language || "auto")}" title="Spoken language: auto, or a code like en, ko">${
         c.language && c.language !== "auto" && !(conf.whisper_langs || []).includes(c.language)

@@ -226,6 +226,23 @@ MODEL_MISSING = lambda: None  # noqa: E731
 CACHE = os.environ.get("EPG_CACHE", os.path.join(
     os.path.dirname(os.environ.get("CHANNELS_FILE", "/config/channels.json")), "epg_translations.sqlite"))
 
+# Seconds the translation model stays loaded after a job (it holds about
+# 1.4 GB, and translating leaves another gigabyte or so of freed but kept
+# memory, which release_memory hands back).
+NLLB_KEEP = float(os.environ.get("EPG_NLLB_KEEP", "60"))
+
+
+def release_memory():
+    """Return freed heap to the system (glibc keeps it per thread otherwise)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 # Default guide language by channel country, when the channel's language is "auto".
 COUNTRY_LANG = {"il": "he", "tr": "tr", "ir": "fa", "kp": "ko", "kr": "ko", "jp": "ja", "cn": "zh",
                 "tw": "zh", "hk": "zh", "ru": "ru", "ua": "uk", "de": "de", "fr": "fr", "it": "it",
@@ -235,7 +252,7 @@ COUNTRY_LANG.update({cc: "ar" for cc in _ARAB})
 _SCRIPTS = [(re.compile(r"[֐-׿]"), "he"), (re.compile(r"[가-힣]"), "ko"),
             (re.compile(r"[぀-ヿ]"), "ja"), (re.compile(r"[一-鿿]"), "zh"),
             (re.compile(r"[Ѐ-ӿ]"), "ru"), (re.compile(r"[฀-๿]"), "th"),
-            (re.compile(r"[Ͱ-Ͽ]"), "el")]
+            (re.compile(r"[Ͱ-Ͽ]"), "el"), (re.compile(r"[ऀ-ॿ]"), "hi")]
 _ARABIC = re.compile(r"[؀-ۿ]")
 
 
@@ -306,36 +323,71 @@ class Translator:
 
     def __init__(self):
         self.db = None
-        self.mt = None
+        self.mt = None    # NLLB while loaded; False: not available
+        self.used = 0.0   # monotonic time of the last job
+        self.lock = threading.Lock()   # the managed guide and /api/epg share the model and cache
 
     def _ready(self):
+        """Whether translation is available: the model is installed (else its
+        download starts) and the cache is open. The model itself is loaded
+        only when a guide has strings the cache doesn't have (_load)."""
         import nllbget
         if self.mt is False and nllbget.installed():
             self.mt = None   # downloaded since (web page or captions-dvr-get-nllb)
-        if self.mt is None:
-            try:
-                import asr
-                path = nllbget.default_path()
-                if not os.path.exists(os.path.join(path, "model.bin")):
-                    MODEL_MISSING()   # downloads it in the background; translated from the next refresh
-                    self.mt = False
-                    return False
-                self.mt = asr.NLLB(path, int(os.environ.get("EPG_NLLB_THREADS", "2")))
-                self.codes = asr.NLLB_CODES
-            except Exception as e:  # noqa: BLE001 - no NLLB here: guide stays untranslated
-                log.warning("guide translation unavailable: %s", e)
-                self.mt = False
-        if self.mt and self.db is None:
+        if self.mt is None and not nllbget.installed():
+            MODEL_MISSING()   # downloads it in the background; translated from the next refresh
+            self.mt = False
+        if self.mt is False:
+            return False
+        if self.db is None:
+            import asr
             import sqlite3
+            self.codes = asr.NLLB_CODES
             self.db = sqlite3.connect(CACHE, check_same_thread=False)
             # tr2: whole texts translated sentence by sentence (tr cut long ones)
             self.db.execute("CREATE TABLE IF NOT EXISTS tr2 (lang TEXT, src TEXT, en TEXT, "
                             "PRIMARY KEY (lang, src))")
+        return True
+
+    def _load(self):
+        """The model, loaded for new strings (about 3 GB while it
+        translates). It is unloaded EPG_NLLB_KEEP seconds after its last job."""
+        if self.mt is None:
+            try:
+                import asr
+                import nllbget
+                self.mt = asr.NLLB(nllbget.default_path(), int(os.environ.get("EPG_NLLB_THREADS", "2")))
+            except Exception as e:  # noqa: BLE001 - no NLLB here: guide stays untranslated
+                log.warning("guide translation unavailable: %s", e)
+                self.mt = False
+                return False
+            threading.Thread(target=self._unload_when_idle, name="epg-unload", daemon=True).start()
+        self.used = time.monotonic()
         return bool(self.mt)
+
+    def _unload_when_idle(self):
+        while True:
+            time.sleep(max(1.0, self.used + NLLB_KEEP - time.monotonic()))
+            with self.lock:
+                if time.monotonic() - self.used < NLLB_KEEP:
+                    continue
+                if self.mt:
+                    self.mt.close()
+                    self.mt = None
+                    release_memory()
+                    log.info("epg: translation model unloaded")
+                return
 
     def translate_programmes(self, elements, langs):
         """Add English title/sub-title/desc before the originals. Returns the
         number of newly translated strings, or None if translation is off."""
+        with self.lock:
+            try:
+                return self._translate_programmes(elements, langs)
+            finally:
+                self.used = time.monotonic()   # (the model stays for EPG_NLLB_KEEP)
+
+    def _translate_programmes(self, elements, langs):
         if not self._ready():
             return None
         todo = []   # (programme, tag, original element, lang, text)
@@ -364,6 +416,8 @@ class Translator:
                 found[key] = row[0]
             else:
                 new[key] = None
+        if new and not self._load():
+            return None
         by_lang = {}
         for lang, text in new:
             by_lang.setdefault(lang, []).append(text)
@@ -402,3 +456,113 @@ class Translator:
                 desc.text = ""
             desc.text = (desc.text or "").rstrip() + ("\n\n" if desc.text else "") + f"Original title: {title}"
         return len(new)
+
+
+# ------------------------------------------------- stateless guides ---
+
+# Common words of the Latin-script languages a FAST guide is mislabelled
+# "en" in (Samsung's German or French lineups label everything English).
+_STOPWORDS = {
+    "de": set("der die das und mit von für ist im den dem nicht ein eine einer auf zu des sich als auch bei".split()),
+    "fr": set("le la les des et du un une pour avec dans est au aux en sur par qui que ce son sa ses".split()),
+    "es": set("el la los las y de del con para una un en por es que se su sus al lo como".split()),
+    "it": set("il lo la gli le e di del della con per una un che non è nel nella dei degli al si".split()),
+    "pt": set("o a os as e do da dos das com para uma um em não que no na se ao".split()),
+}
+
+
+def guess_latin(text):
+    """The Latin-script language a guide string is written in, or None."""
+    words = re.findall(r"[a-zàâäçéèêëîïôöùûüÿñœæßáíóú']+", text.lower())
+    if len(words) < 3:
+        return None
+    best, score = None, 0.0
+    for lang, stop in _STOPWORDS.items():
+        n = sum(w in stop for w in words) / len(words)
+        if n > score:
+            best, score = lang, n
+    return best if score >= 0.15 else None
+
+
+def translate_xmltv(body, translator, default=""):
+    """Translate any XMLTV guide into English (stateless mode, /api/epg).
+    Each channel's language comes from its strings' lang attributes, with
+    strings labelled "en" that read as German, French... relabelled first;
+    non-Latin scripts are recognised whatever the label. Returns (xml bytes,
+    newly translated strings or None if translation is unavailable)."""
+    root = ET.fromstring(body)
+    elements = root.findall("programme")
+    votes = {}
+    for el in elements:
+        for tag in ("title", "sub-title", "desc"):
+            for e in el.findall(tag):
+                text = (e.text or "").strip()
+                if not text:
+                    continue
+                lang = e.get("lang") or ""
+                if lang in ("", "en") and not non_latin(text) and not looks_english(text):
+                    g = guess_latin(text)
+                    if g:
+                        e.set("lang", g)
+                        lang = g
+                if lang and lang != "en":
+                    votes.setdefault(el.get("channel"), {}).setdefault(lang, 0)
+                    votes[el.get("channel")][lang] += 1
+    langs = {ch: max(v, key=v.get) for ch, v in votes.items()}
+    for el in elements:
+        langs.setdefault(el.get("channel"), default)   # "": non-Latin scripts only
+    n = translator.translate_programmes(elements, langs)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), n
+
+
+class AdhocGuides:
+    """/api/epg?url=: an outside XMLTV guide, translated. The first request
+    gets the original guide straight away and starts the translation in the
+    background; later ones get the translated copy. It is re-fetched and
+    re-translated (only new strings: the cache keeps the rest) after
+    EPG_ADHOC_MINUTES (default 60): FAST guides often cover only the next
+    few hours, so an older copy runs dry."""
+
+    TTL = float(os.environ.get("EPG_ADHOC_MINUTES", "60")) * 60
+
+    def __init__(self, translator):
+        self.translator = translator
+        self.lock = threading.Lock()
+        self.cache = {}   # (url, lang) -> {"xml", "at", "translated", "busy"}
+
+    def get(self, url, lang=""):
+        key = (url, lang)
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit and (hit["busy"] or time.time() - hit["at"] < self.TTL):
+                return hit["xml"]
+        raw = self._fetch(url)
+        with self.lock:
+            hit = self.cache.setdefault(key, {"xml": raw, "at": 0, "translated": False, "busy": False})
+            if not hit["translated"]:
+                hit["xml"] = raw
+            hit["busy"] = True
+        threading.Thread(target=self._translate, args=(key, raw), daemon=True).start()
+        return hit["xml"]
+
+    @staticmethod
+    def _fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+        return gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
+
+    def _translate(self, key, raw):
+        t0 = time.monotonic()
+        try:
+            xml, n = translate_xmltv(raw, self.translator, key[1])
+        except Exception as e:  # noqa: BLE001 - keep serving the original
+            log.warning("epg %s: translation failed: %s", key[0], e)
+            xml, n = raw, None
+        with self.lock:
+            hit = self.cache[key]
+            hit.update(at=time.time(), busy=False)
+            if n is not None:
+                hit.update(xml=xml, translated=True)
+        log.info("epg %s: %s new strings translated in %.0fs", key[0],
+                 "no" if n is None else n, time.monotonic() - t0)

@@ -1,10 +1,12 @@
 """The relay's HTTP endpoints, against a real relay process with no ASR:
 an empty start, playlist.m3u = HLS with a subtitle rendition, no .ts routes."""
+import http.server
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -57,9 +59,32 @@ def get(url):
         return e.code, e.read().decode()
 
 
+class Feed(http.server.BaseHTTPRequestHandler):
+    """The channels' source: its playlist answers (a cold tune checks that
+    the feed loads), with nothing in it."""
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"#EXTM3U\n")
+
+    def log_message(self, *a):
+        pass
+
+
+FEED = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Feed)
+threading.Thread(target=FEED.serve_forever, daemon=True).start()
 CHANNELS = {"sources": [], "settings": {}, "channels": [
-    {"id": "t1", "name": "Test One", "number": 9001, "url": "http://127.0.0.1:1/none.m3u8", "source": "manual",
-     "enabled": True, "language": "en", "tvg": {}, "headers": {}}]}
+    {"id": "t1", "name": "Test One", "number": 9001, "url": f"http://127.0.0.1:{FEED.server_port}/none.m3u8",
+     "source": "manual", "enabled": True, "language": "en", "tvg": {}, "headers": {}}]}
+
+
+def test_dead_feed_fails_the_tune(relay):
+    """A feed that doesn't answer: the first playlist request fails, so
+    Channels DVR tunes the recording's alternate channel."""
+    dead = json.loads(json.dumps(CHANNELS))
+    dead["channels"][0]["url"] = "http://127.0.0.1:1/none.m3u8"
+    base, _, _ = relay(dead)
+    assert get(base + "/hls/t1/master.m3u8")[0] == 503
 
 
 def test_empty_start(relay):
